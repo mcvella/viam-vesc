@@ -164,13 +164,13 @@ class Vesc(Motor, EasyResource):
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_CURRENT = 0xA7
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xA8
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xA9
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xAA
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP = 0xAB
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP = 0xAC
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xAD
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xAE
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xAF
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xB0
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xAA
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xAB
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP = 0xAC
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xAD
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xAE
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xAF
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xB0
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xBF
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xC0
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xC1
@@ -193,24 +193,24 @@ class Vesc(Motor, EasyResource):
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xD2
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xD3
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xD4
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xD5
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xD6
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xD7
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xD8
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xD5
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xD6
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xD7
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xD8
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xD9
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xDA
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xDA
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xDB
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xDC
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xDD
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xDE
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xDF
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xE0
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xE1
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xE2
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xE3
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xDC
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xDD
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xDE
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xDF
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xE0
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xE1
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xE2
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xE3
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xE4
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xE5
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xE6
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xE5
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xE6
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_CURRENT = 0xB3
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_CURRENT = 0xB4
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xB5
@@ -270,24 +270,24 @@ class Vesc(Motor, EasyResource):
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xEB
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xEC
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xED
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xEE
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xEE
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xEF
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xF0
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xF0
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xF1
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xF2
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xF3
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xF3
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xF4
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xF5
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_OFFSET = 0xF6
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xF7
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_GAIN = 0xF8
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xF9
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xFA
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_RESISTANCE = 0xFA
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xFB
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_CURRENT = 0xFC
     COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xFD
-    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xFE
-    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xFF
+    COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_VOLTAGE = 0xFE
+    COMM_BM_SET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0xFF
     COMM_BM_GET_BATT_TEMP_SENSOR_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP_TEMP = 0x100
 
     def __init__(self, name: str):
@@ -380,27 +380,34 @@ class Vesc(Motor, EasyResource):
             crc ^= byte << 8
             for _ in range(8):
                 if crc & 0x8000:
-                    crc = (crc << 1) ^ 0x1021
+                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF
                 else:
-                    crc = crc << 1
-                crc &= 0xFFFF
+                    crc = (crc << 1) & 0xFFFF
         return crc
 
-    def _pack_packet(self, packet_id: int, payload: bytes = b'') -> bytes:
-        """Pack a VESC packet with proper formatting and CRC"""
-        packet = struct.pack('>B', packet_id) + payload
-        crc = self._crc16(packet)
-        packet += struct.pack('>H', crc)
+    def _pack_payload(self, payload: bytes) -> bytes:
+        """Pack payload with VESC protocol framing"""
+        if len(payload) <= 256:
+            header = struct.pack('BB', 2, len(payload))  # Short packet
+        else:
+            header = struct.pack('BBB', 3, len(payload) >> 8, len(payload) & 0xFF)  # Long packet
+        
+        crc = self._crc16(payload)
+        crc_bytes = struct.pack('>H', crc)
+        packet = header + payload + crc_bytes + b'\x03'
         return packet
 
-    def _send_packet(self, packet_id: int, payload: bytes = b'') -> bool:
-        """Send a packet to the VESC"""
+    def _send_packet(self, command_id: int, payload: bytes = b'') -> bool:
+        """Send a packet to the VESC using the working protocol"""
         if not self.serial_port or not self.serial_port.is_open:
             self.logger.error("Serial port not open")
             return False
         
         try:
-            packet = self._pack_packet(packet_id, payload)
+            # Create the full payload with command ID
+            full_payload = struct.pack('B', command_id) + payload
+            packet = self._pack_payload(full_payload)
+            
             self.serial_port.write(packet)
             self.serial_port.flush()
             return True
@@ -471,17 +478,15 @@ class Vesc(Motor, EasyResource):
         async with self._lock:
             power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
             
-            # Convert power to duty cycle (0.0 to 1.0)
-            duty = abs(power)
+            # Convert to int32 (duty * 100000) - matching working script
+            duty_int = int(power * 100000)
+            payload = struct.pack('>i', duty_int)
             
-            # Pack duty cycle as float32
-            payload = struct.pack('>f', duty)
-            
-            if self._send_packet(self.COMM_SET_DUTY, payload):
+            if self._send_packet(5, payload):  # COMM_SET_DUTY = 5
                 self._is_powered = power != 0.0
                 self._current_power = power
                 self._is_moving = power != 0.0
-                self.logger.info(f"Set power to {power:.2f} (duty: {duty:.2f})")
+                self.logger.info(f"Set power to {power:.2f} (duty_int: {duty_int})")
             else:
                 raise RuntimeError("Failed to set motor power")
 
@@ -501,9 +506,11 @@ class Vesc(Motor, EasyResource):
                 await self.stop()
                 return
             
-            # Set RPM
-            rpm_payload = struct.pack('>f', rpm)
-            if not self._send_packet(self.COMM_SET_RPM, rpm_payload):
+            # Set RPM using int32 encoding
+            rpm_int = int(rpm)
+            rpm_payload = struct.pack('>i', rpm_int)
+            
+            if not self._send_packet(8, rpm_payload):  # COMM_SET_RPM = 8
                 raise RuntimeError("Failed to set RPM")
             
             self._current_rpm = rpm
@@ -549,9 +556,11 @@ class Vesc(Motor, EasyResource):
     ):
         """Set the motor RPM"""
         async with self._lock:
-            rpm_payload = struct.pack('>f', rpm)
+            # Convert to int32
+            rpm_int = int(rpm)
+            rpm_payload = struct.pack('>i', rpm_int)
             
-            if self._send_packet(self.COMM_SET_RPM, rpm_payload):
+            if self._send_packet(8, rpm_payload):  # COMM_SET_RPM = 8
                 self._current_rpm = rpm
                 self._is_powered = rpm != 0.0
                 self._is_moving = rpm != 0.0
@@ -601,10 +610,11 @@ class Vesc(Motor, EasyResource):
     ):
         """Stop the motor"""
         async with self._lock:
-            # Send zero duty cycle to stop
-            payload = struct.pack('>f', 0.0)
+            # Send zero duty cycle to stop using int32 encoding
+            duty_int = 0
+            payload = struct.pack('>i', duty_int)
             
-            if self._send_packet(self.COMM_SET_DUTY, payload):
+            if self._send_packet(5, payload):  # COMM_SET_DUTY = 5
                 self._is_powered = False
                 self._current_power = 0.0
                 self._current_rpm = 0.0
@@ -639,8 +649,8 @@ class Vesc(Motor, EasyResource):
         
         if command_name == "get_vesc_values":
             # Get VESC telemetry values
-            if self._send_packet(self.COMM_GET_VALUES):
-                payload = self._read_packet(self.COMM_GET_VALUES)
+            if self._send_packet(4):  # COMM_GET_VALUES = 4
+                payload = self._read_packet(4)
                 if payload:
                     # Parse VESC values (this is a simplified version)
                     # In a real implementation, you'd parse all the telemetry data
@@ -654,8 +664,10 @@ class Vesc(Motor, EasyResource):
             # Set motor current
             current = command.get("current", 0.0)
             if isinstance(current, (int, float)):
-                payload = struct.pack('>f', float(current))
-                if self._send_packet(self.COMM_SET_CURRENT, payload):
+                # Convert to milliamps and use int32 encoding
+                current_ma = int(float(current) * 1000)
+                payload = struct.pack('>i', current_ma)
+                if self._send_packet(6, payload):  # COMM_SET_CURRENT = 6
                     return {"status": "success", "current": current}
                 else:
                     return {"status": "error", "message": "Failed to set current"}
