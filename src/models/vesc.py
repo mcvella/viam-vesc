@@ -50,6 +50,9 @@ class Vesc(Motor, EasyResource):
         self._is_moving = False
         self._lock = asyncio.Lock()
         self._debug_mode = False
+        self._power_task = None
+        self._target_power = 0.0
+        self._stop_power_task = False
 
     @classmethod
     def new(
@@ -153,6 +156,36 @@ class Vesc(Motor, EasyResource):
                 else:
                     crc = (crc << 1) & 0xFFFF
         return crc
+
+    def _pack_payload(self, payload: bytes) -> bytes:
+        """Pack payload with VESC protocol framing"""
+        if len(payload) <= 256:
+            header = struct.pack('BB', 2, len(payload))  # Short packet
+        else:
+            header = struct.pack('BBB', 3, len(payload) >> 8, len(payload) & 0xFF)  # Long packet
+        
+        crc = self._crc16(payload)
+        crc_bytes = struct.pack('>H', crc)
+        packet = header + payload + crc_bytes + b'\x03'
+        return packet
+
+    def _send_packet(self, command_id: int, payload: bytes = b'') -> bool:
+        """Send a packet to the VESC using the working protocol"""
+        if not self.serial_port or not self.serial_port.is_open:
+            self.logger.error("Serial port not open")
+            return False
+        
+        try:
+            # Create the full payload with command ID
+            full_payload = struct.pack('B', command_id) + payload
+            packet = self._pack_payload(full_payload)
+            
+            self.serial_port.write(packet)
+            self.serial_port.flush()
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to send packet: {e}")
+            return False
 
     def _send_simple_command(self, command_id: int, payload: bytes = b'') -> bool:
         """Send a simple VESC command with basic packet structure"""
@@ -263,36 +296,32 @@ class Vesc(Motor, EasyResource):
         async with self._lock:
             power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
             
-            # Try to send the power command
-            success = False
-            
-            # Method 1: Float encoding (standard VESC)
-            try:
-                payload = struct.pack('>f', power)
-                if self._send_simple_command(self.COMM_SET_DUTY, payload):
-                    success = True
-                    self.logger.info(f"Set power to {power:.2f} (float encoding)")
-            except Exception as e:
-                self.logger.debug(f"Float encoding failed: {e}")
-            
-            # Method 2: Int32 encoding (some VESC variants)
-            if not success:
+            # Stop existing power task if running
+            if self._power_task and not self._power_task.done():
+                self._stop_power_task = True
                 try:
-                    duty_int = int(power * 100000)
-                    payload = struct.pack('>i', duty_int)
-                    if self._send_simple_command(self.COMM_SET_DUTY, payload):
-                        success = True
-                        self.logger.info(f"Set power to {power:.2f} (int32 encoding)")
-                except Exception as e:
-                    self.logger.debug(f"Int32 encoding failed: {e}")
+                    await asyncio.wait_for(self._power_task, timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                self._power_task = None
             
-            if success:
-                self._is_powered = power != 0.0
-                self._current_power = power
-                self._is_moving = power != 0.0
+            # Update target power
+            self._target_power = power
+            self._is_powered = power != 0.0
+            self._current_power = power
+            self._is_moving = power != 0.0
+            
+            if power != 0.0:
+                # Start background power task for continuous operation
+                self._stop_power_task = False
+                self._power_task = asyncio.create_task(self._power_task_loop())
+                self.logger.info(f"Started power task for {power:.2f}")
             else:
-                self.logger.error("Failed to set motor power")
-                raise RuntimeError("Failed to set motor power")
+                # Send immediate stop command
+                duty_int = 0
+                payload = struct.pack('>i', duty_int)
+                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+                self.logger.info("Motor stopped")
 
     async def go_for(
         self,
@@ -425,35 +454,27 @@ class Vesc(Motor, EasyResource):
     ):
         """Stop the motor"""
         async with self._lock:
-            # Send stop command
-            success = False
-            
-            # Method 1: Zero duty cycle
-            try:
-                payload = struct.pack('>f', 0.0)
-                if self._send_simple_command(self.COMM_SET_DUTY, payload):
-                    success = True
-            except Exception as e:
-                self.logger.debug(f"Zero duty cycle failed: {e}")
-            
-            # Method 2: Zero current
-            if not success:
+            # Stop background power task
+            if self._power_task and not self._power_task.done():
+                self._stop_power_task = True
                 try:
-                    payload = struct.pack('>f', 0.0)
-                    if self._send_simple_command(self.COMM_SET_CURRENT, payload):
-                        success = True
-                except Exception as e:
-                    self.logger.debug(f"Zero current failed: {e}")
+                    await asyncio.wait_for(self._power_task, timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                self._power_task = None
             
-            if success:
-                self._is_powered = False
-                self._current_power = 0.0
-                self._current_rpm = 0.0
-                self._is_moving = False
-                self.logger.info("Motor stopped")
-            else:
-                self.logger.error("Failed to stop motor")
-                raise RuntimeError("Failed to stop motor")
+            # Send immediate stop command
+            duty_int = 0
+            payload = struct.pack('>i', duty_int)
+            self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+            
+            # Update state
+            self._target_power = 0.0
+            self._is_powered = False
+            self._current_power = 0.0
+            self._current_rpm = 0.0
+            self._is_moving = False
+            self.logger.info("Motor stopped")
 
     async def is_powered(
         self,
@@ -546,4 +567,18 @@ class Vesc(Motor, EasyResource):
     ) -> List[Geometry]:
         """Get the geometries of the motor"""
         return []
+
+    async def _power_task_loop(self):
+        """Background task to continuously send power commands"""
+        while not self._stop_power_task:
+            try:
+                if self._target_power != 0.0 and self.serial_port and self.serial_port.is_open:
+                    # Send power command every 50ms to keep motor running
+                    duty_int = int(self._target_power * 100000)
+                    payload = struct.pack('>i', duty_int)
+                    self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+                await asyncio.sleep(0.05)  # 50ms interval
+            except Exception as e:
+                self.logger.error(f"Power task error: {e}")
+                await asyncio.sleep(0.05)
 
