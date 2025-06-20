@@ -53,6 +53,7 @@ class Vesc(Motor, EasyResource):
         self._power_task = None
         self._target_power = 0.0
         self._stop_power_task = False
+        self._command_interval = 0.01  # 10ms default, configurable
 
     @classmethod
     def new(
@@ -109,6 +110,7 @@ class Vesc(Motor, EasyResource):
         self.baudrate = int(attributes.get("baudrate", 115200))
         self.timeout = float(attributes.get("timeout", 1.0))
         self._debug_mode = bool(attributes.get("debug", False))
+        self._command_interval = float(attributes.get("command_interval", 0.01))  # Configurable command interval
         
         # Initialize serial connection
         try:
@@ -296,6 +298,12 @@ class Vesc(Motor, EasyResource):
         async with self._lock:
             power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
             
+            # Check if we're changing direction
+            direction_change = False
+            if self._current_power != 0.0:
+                if (self._current_power > 0 and power < 0) or (self._current_power < 0 and power > 0):
+                    direction_change = True
+            
             # Stop existing power task if running
             if self._power_task and not self._power_task.done():
                 self._stop_power_task = True
@@ -304,6 +312,13 @@ class Vesc(Motor, EasyResource):
                 except asyncio.TimeoutError:
                     pass
                 self._power_task = None
+            
+            # If changing direction, send a stop command and wait briefly
+            if direction_change:
+                duty_int = 0
+                payload = struct.pack('>i', duty_int)
+                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+                await asyncio.sleep(0.1)  # 100ms delay for direction change
             
             # Update target power
             self._target_power = power
@@ -559,6 +574,25 @@ class Vesc(Motor, EasyResource):
                 "debug_mode": self._debug_mode
             }
         
+        elif command_name == "get_power_task_status":
+            # Get power task status for debugging
+            task_running = self._power_task is not None and not self._power_task.done()
+            return {
+                "status": "success",
+                "power_task_running": task_running,
+                "target_power": self._target_power,
+                "stop_power_task": self._stop_power_task
+            }
+        
+        elif command_name == "set_command_interval":
+            # Set command interval for testing different frequencies
+            interval = command.get("interval", 0.01)
+            if isinstance(interval, (int, float)) and 0.001 <= interval <= 0.1:
+                self._command_interval = float(interval)
+                return {"status": "success", "command_interval": self._command_interval}
+            else:
+                return {"status": "error", "message": "Invalid interval (must be between 0.001 and 0.1 seconds)"}
+        
         else:
             return {"status": "error", "message": f"Unknown command: {command_name}"}
 
@@ -570,15 +604,26 @@ class Vesc(Motor, EasyResource):
 
     async def _power_task_loop(self):
         """Background task to continuously send power commands"""
+        consecutive_failures = 0
         while not self._stop_power_task:
             try:
                 if self._target_power != 0.0 and self.serial_port and self.serial_port.is_open:
-                    # Send power command every 50ms to keep motor running
+                    # Send power command every 10ms to keep motor running smoothly under load
                     duty_int = int(self._target_power * 100000)
                     payload = struct.pack('>i', duty_int)
-                    self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-                await asyncio.sleep(0.05)  # 50ms interval
+                    if self._send_packet(5, payload):  # COMM_SET_DUTY = 5
+                        consecutive_failures = 0  # Reset failure counter on success
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures > 10:  # Stop if too many failures
+                            self.logger.error("Too many consecutive failures, stopping power task")
+                            break
+                await asyncio.sleep(self._command_interval)  # 10ms interval for smoother operation under load
             except Exception as e:
+                consecutive_failures += 1
                 self.logger.error(f"Power task error: {e}")
-                await asyncio.sleep(0.05)
+                if consecutive_failures > 10:  # Stop if too many failures
+                    self.logger.error("Too many consecutive failures, stopping power task")
+                    break
+                await asyncio.sleep(self._command_interval)
 
