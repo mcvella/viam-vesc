@@ -1,0 +1,13 @@
+{
+  "module_name": "vesc",
+  "namespace": "mcvella",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "motor",
+  "model_name": "vesc",
+  "enable_cloud_build": false,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-06-20T17:30:55.971914Z",
+  "module_readme_link": "README.md"
+}

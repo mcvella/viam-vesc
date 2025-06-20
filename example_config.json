@@ -1,0 +1,21 @@
+{
+  "components": [
+    {
+      "name": "vesc_motor",
+      "type": "motor",
+      "model": "mcvella:vesc:vesc",
+      "attributes": {
+        "port": "/dev/ttyACM0",
+        "baudrate": 115200,
+        "timeout": 1.0
+      }
+    }
+  ],
+  "modules": [
+    {
+      "name": "vesc_module",
+      "executable_path": "./run.sh",
+      "type": "local"
+    }
+  ]
+} 
