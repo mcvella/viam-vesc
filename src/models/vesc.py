@@ -54,6 +54,9 @@ class Vesc(Motor, EasyResource):
         self._target_power = 0.0
         self._stop_power_task = False
         self._command_interval = 0.01  # 10ms default, configurable
+        self._ramp_up_enabled = True
+        self._ramp_up_rate = 0.1  # Power change per second
+        self._current_ramp_power = 0.0
 
     @classmethod
     def new(
@@ -111,6 +114,8 @@ class Vesc(Motor, EasyResource):
         self.timeout = float(attributes.get("timeout", 1.0))
         self._debug_mode = bool(attributes.get("debug", False))
         self._command_interval = float(attributes.get("command_interval", 0.01))  # Configurable command interval
+        self._ramp_up_enabled = bool(attributes.get("ramp_up_enabled", True))
+        self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.1))  # Power change per second
         
         # Initialize serial connection
         try:
@@ -593,6 +598,31 @@ class Vesc(Motor, EasyResource):
             else:
                 return {"status": "error", "message": "Invalid interval (must be between 0.001 and 0.1 seconds)"}
         
+        elif command_name == "set_ramp_up":
+            # Enable/disable ramp-up
+            enabled = command.get("enabled", True)
+            self._ramp_up_enabled = bool(enabled)
+            return {"status": "success", "ramp_up_enabled": self._ramp_up_enabled}
+        
+        elif command_name == "set_ramp_rate":
+            # Set ramp-up rate
+            rate = command.get("rate", 0.1)
+            if isinstance(rate, (int, float)) and 0.01 <= rate <= 1.0:
+                self._ramp_up_rate = float(rate)
+                return {"status": "success", "ramp_up_rate": self._ramp_up_rate}
+            else:
+                return {"status": "error", "message": "Invalid rate (must be between 0.01 and 1.0 power/second)"}
+        
+        elif command_name == "get_ramp_status":
+            # Get current ramp-up status
+            return {
+                "status": "success",
+                "ramp_up_enabled": self._ramp_up_enabled,
+                "ramp_up_rate": self._ramp_up_rate,
+                "current_ramp_power": self._current_ramp_power,
+                "target_power": self._target_power
+            }
+        
         else:
             return {"status": "error", "message": f"Unknown command: {command_name}"}
 
@@ -608,8 +638,23 @@ class Vesc(Motor, EasyResource):
         while not self._stop_power_task:
             try:
                 if self._target_power != 0.0 and self.serial_port and self.serial_port.is_open:
-                    # Send power command every 10ms to keep motor running smoothly under load
-                    duty_int = int(self._target_power * 100000)
+                    # Apply ramp-up if enabled
+                    if self._ramp_up_enabled:
+                        # Calculate power change per command interval
+                        power_change_per_interval = self._ramp_up_rate * self._command_interval
+                        
+                        # Ramp up or down to target power
+                        if self._current_ramp_power < self._target_power:
+                            self._current_ramp_power = min(self._target_power, self._current_ramp_power + power_change_per_interval)
+                        elif self._current_ramp_power > self._target_power:
+                            self._current_ramp_power = max(self._target_power, self._current_ramp_power - power_change_per_interval)
+                        
+                        # Use ramped power for command
+                        duty_int = int(self._current_ramp_power * 100000)
+                    else:
+                        # No ramp-up, use target power directly
+                        duty_int = int(self._target_power * 100000)
+                    
                     payload = struct.pack('>i', duty_int)
                     if self._send_packet(5, payload):  # COMM_SET_DUTY = 5
                         consecutive_failures = 0  # Reset failure counter on success
@@ -618,6 +663,10 @@ class Vesc(Motor, EasyResource):
                         if consecutive_failures > 10:  # Stop if too many failures
                             self.logger.error("Too many consecutive failures, stopping power task")
                             break
+                else:
+                    # Reset ramp power when stopped
+                    self._current_ramp_power = 0.0
+                    
                 await asyncio.sleep(self._command_interval)  # 10ms interval for smoother operation under load
             except Exception as e:
                 consecutive_failures += 1
