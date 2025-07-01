@@ -27,7 +27,7 @@ class Vesc(Motor, EasyResource):
     COMM_ERASE_NEW_APP = 0x34
     COMM_WRITE_NEW_APP_DATA = 0x35
     COMM_GET_VALUES = 0x27
-    COMM_SET_DUTY = 0x00
+    COMM_SET_DUTY = 5
     COMM_SET_CURRENT = 0x01
     COMM_SET_CURRENT_BRAKE = 0x02
     COMM_SET_RPM = 0x03
@@ -49,7 +49,7 @@ class Vesc(Motor, EasyResource):
         self._position = 0.0
         self._is_moving = False
         self._lock = asyncio.Lock()
-        self._debug_mode = False
+        self._debug_mode = True
         self._power_task = None
         self._target_power = 0.0
         self._stop_power_task = False
@@ -57,6 +57,7 @@ class Vesc(Motor, EasyResource):
         self._ramp_up_enabled = True
         self._ramp_up_rate = 0.1  # Power change per second
         self._current_ramp_power = 0.0
+        self._direction_change_in_progress = False  # Add direction change lock
 
     @classmethod
     def new(
@@ -112,10 +113,10 @@ class Vesc(Motor, EasyResource):
         self.port = str(attributes.get("port", "/dev/ttyACM0"))
         self.baudrate = int(attributes.get("baudrate", 115200))
         self.timeout = float(attributes.get("timeout", 1.0))
-        self._debug_mode = bool(attributes.get("debug", False))
+        self._debug_mode = bool(attributes.get("debug", True))
         self._command_interval = float(attributes.get("command_interval", 0.01))  # Configurable command interval
         self._ramp_up_enabled = bool(attributes.get("ramp_up_enabled", True))
-        self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.1))  # Power change per second
+        self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.1))
         
         # Initialize serial connection
         try:
@@ -183,12 +184,24 @@ class Vesc(Motor, EasyResource):
             return False
         
         try:
+            # Clear input buffer before sending
+            self.serial_port.reset_input_buffer()
+            
             # Create the full payload with command ID
             full_payload = struct.pack('B', command_id) + payload
             packet = self._pack_payload(full_payload)
             
+            if self._debug_mode:
+                self.logger.debug(f"Sending packet: command_id={command_id}, payload={payload.hex()}, full_packet={packet.hex()}")
+            
+            # Clear output buffer and send
+            self.serial_port.reset_output_buffer()
             self.serial_port.write(packet)
             self.serial_port.flush()
+            
+            # Small delay to ensure command is processed
+            time.sleep(0.001)
+            
             return True
         except Exception as e:
             self.logger.error(f"Failed to send packet: {e}")
@@ -303,13 +316,7 @@ class Vesc(Motor, EasyResource):
         async with self._lock:
             power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
             
-            # Check if we're changing direction
-            direction_change = False
-            if self._current_power != 0.0:
-                if (self._current_power > 0 and power < 0) or (self._current_power < 0 and power > 0):
-                    direction_change = True
-            
-            # Stop existing power task if running
+            # Stop any existing power task
             if self._power_task and not self._power_task.done():
                 self._stop_power_task = True
                 try:
@@ -318,29 +325,23 @@ class Vesc(Motor, EasyResource):
                     pass
                 self._power_task = None
             
-            # If changing direction, send a stop command and wait briefly
-            if direction_change:
-                duty_int = 0
-                payload = struct.pack('>i', duty_int)
-                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-                await asyncio.sleep(0.1)  # 100ms delay for direction change
-            
-            # Update target power
+            # Update state
             self._target_power = power
             self._is_powered = power != 0.0
             self._current_power = power
             self._is_moving = power != 0.0
             
+            # Send command directly - no complex logic
+            duty_float = power
+            payload = struct.pack('>f', duty_float)
+            self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+            
             if power != 0.0:
-                # Start background power task for continuous operation
+                # Start simple timer task to keep motor running
                 self._stop_power_task = False
-                self._power_task = asyncio.create_task(self._power_task_loop())
-                self.logger.info(f"Started power task for {power:.2f}")
+                self._power_task = asyncio.create_task(self._simple_power_task())
+                self.logger.info(f"Set power to {power:.2f}")
             else:
-                # Send immediate stop command
-                duty_int = 0
-                payload = struct.pack('>i', duty_int)
-                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
                 self.logger.info("Motor stopped")
 
     async def go_for(
@@ -483,9 +484,9 @@ class Vesc(Motor, EasyResource):
                     pass
                 self._power_task = None
             
-            # Send immediate stop command
-            duty_int = 0
-            payload = struct.pack('>i', duty_int)
+            # Send direct stop command
+            duty_float = 0.0
+            payload = struct.pack('>f', duty_float)
             self._send_packet(5, payload)  # COMM_SET_DUTY = 5
             
             # Update state
@@ -579,16 +580,6 @@ class Vesc(Motor, EasyResource):
                 "debug_mode": self._debug_mode
             }
         
-        elif command_name == "get_power_task_status":
-            # Get power task status for debugging
-            task_running = self._power_task is not None and not self._power_task.done()
-            return {
-                "status": "success",
-                "power_task_running": task_running,
-                "target_power": self._target_power,
-                "stop_power_task": self._stop_power_task
-            }
-        
         elif command_name == "set_command_interval":
             # Set command interval for testing different frequencies
             interval = command.get("interval", 0.01)
@@ -623,6 +614,44 @@ class Vesc(Motor, EasyResource):
                 "target_power": self._target_power
             }
         
+        elif command_name == "force_stop":
+            # Force stop the motor and reset all state
+            async with self._lock:
+                # Stop power task
+                if self._power_task and not self._power_task.done():
+                    self._stop_power_task = True
+                    try:
+                        await asyncio.wait_for(self._power_task, timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    self._power_task = None
+                
+                # Send multiple stop commands
+                for _ in range(5):
+                    duty_float = 0.0
+                    payload = struct.pack('>f', duty_float)
+                    self._send_packet(5, payload)  # COMM_SET_DUTY = 5
+                    await asyncio.sleep(0.02)
+                
+                # Reset all state
+                self._target_power = 0.0
+                self._is_powered = False
+                self._current_power = 0.0
+                self._current_rpm = 0.0
+                self._is_moving = False
+                self._current_ramp_power = 0.0
+                
+                return {"status": "success", "message": "Motor force stopped and state reset"}
+        
+        elif command_name == "clear_buffers":
+            # Clear all serial buffers
+            if self.serial_port:
+                self.serial_port.reset_input_buffer()
+                self.serial_port.reset_output_buffer()
+                return {"status": "success", "message": "Serial buffers cleared"}
+            else:
+                return {"status": "error", "message": "Serial port not open"}
+        
         else:
             return {"status": "error", "message": f"Unknown command: {command_name}"}
 
@@ -632,47 +661,16 @@ class Vesc(Motor, EasyResource):
         """Get the geometries of the motor"""
         return []
 
-    async def _power_task_loop(self):
-        """Background task to continuously send power commands"""
-        consecutive_failures = 0
+    async def _simple_power_task(self):
+        """Simple timer task to keep motor running"""
         while not self._stop_power_task:
             try:
-                if self._target_power != 0.0 and self.serial_port and self.serial_port.is_open:
-                    # Apply ramp-up if enabled
-                    if self._ramp_up_enabled:
-                        # Calculate power change per command interval
-                        power_change_per_interval = self._ramp_up_rate * self._command_interval
-                        
-                        # Ramp up or down to target power
-                        if self._current_ramp_power < self._target_power:
-                            self._current_ramp_power = min(self._target_power, self._current_ramp_power + power_change_per_interval)
-                        elif self._current_ramp_power > self._target_power:
-                            self._current_ramp_power = max(self._target_power, self._current_ramp_power - power_change_per_interval)
-                        
-                        # Use ramped power for command
-                        duty_int = int(self._current_ramp_power * 100000)
-                    else:
-                        # No ramp-up, use target power directly
-                        duty_int = int(self._target_power * 100000)
-                    
-                    payload = struct.pack('>i', duty_int)
-                    if self._send_packet(5, payload):  # COMM_SET_DUTY = 5
-                        consecutive_failures = 0  # Reset failure counter on success
-                    else:
-                        consecutive_failures += 1
-                        if consecutive_failures > 10:  # Stop if too many failures
-                            self.logger.error("Too many consecutive failures, stopping power task")
-                            break
-                else:
-                    # Reset ramp power when stopped
-                    self._current_ramp_power = 0.0
-                    
+                # Send command directly - no complex logic
+                duty_float = self._target_power
+                payload = struct.pack('>f', duty_float)
+                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
                 await asyncio.sleep(self._command_interval)  # 10ms interval for smoother operation under load
             except Exception as e:
-                consecutive_failures += 1
-                self.logger.error(f"Power task error: {e}")
-                if consecutive_failures > 10:  # Stop if too many failures
-                    self.logger.error("Too many consecutive failures, stopping power task")
-                    break
+                self.logger.error(f"Simple power task error: {e}")
                 await asyncio.sleep(self._command_interval)
 
