@@ -58,6 +58,7 @@ class Vesc(Motor, EasyResource):
         self._ramp_up_rate = 0.1  # Power change per second
         self._current_ramp_power = 0.0
         self._direction_change_in_progress = False  # Add direction change lock
+        self._duty_cycle_format = "int"
 
     @classmethod
     def new(
@@ -117,6 +118,7 @@ class Vesc(Motor, EasyResource):
         self._command_interval = float(attributes.get("command_interval", 0.01))  # Configurable command interval
         self._ramp_up_enabled = bool(attributes.get("ramp_up_enabled", True))
         self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.1))
+        self._duty_cycle_format = attributes.get("duty_cycle_format", "int")
         
         # Initialize serial connection
         try:
@@ -331,9 +333,12 @@ class Vesc(Motor, EasyResource):
             self._current_power = power
             self._is_moving = power != 0.0
             
-            # Send command directly - no complex logic
-            duty_float = power
-            payload = struct.pack('>f', duty_float)
+            # Duty cycle format selection
+            if self._duty_cycle_format == "float":
+                payload = struct.pack('>f', self._target_power)
+            else:
+                duty_int = int(self._target_power * 100000)
+                payload = struct.pack('>i', duty_int)
             self._send_packet(5, payload)  # COMM_SET_DUTY = 5
             
             if power != 0.0:
@@ -484,9 +489,11 @@ class Vesc(Motor, EasyResource):
                     pass
                 self._power_task = None
             
-            # Send direct stop command
-            duty_float = 0.0
-            payload = struct.pack('>f', duty_float)
+            # Duty cycle format selection
+            if self._duty_cycle_format == "float":
+                payload = struct.pack('>f', 0.0)
+            else:
+                payload = struct.pack('>i', 0)
             self._send_packet(5, payload)  # COMM_SET_DUTY = 5
             
             # Update state
@@ -628,8 +635,10 @@ class Vesc(Motor, EasyResource):
                 
                 # Send multiple stop commands
                 for _ in range(5):
-                    duty_float = 0.0
-                    payload = struct.pack('>f', duty_float)
+                    if self._duty_cycle_format == "float":
+                        payload = struct.pack('>f', 0.0)
+                    else:
+                        payload = struct.pack('>i', 0)
                     self._send_packet(5, payload)  # COMM_SET_DUTY = 5
                     await asyncio.sleep(0.02)
                 
@@ -662,14 +671,28 @@ class Vesc(Motor, EasyResource):
         return []
 
     async def _simple_power_task(self):
-        """Simple timer task to keep motor running"""
         while not self._stop_power_task:
             try:
-                # Send command directly - no complex logic
-                duty_float = self._target_power
-                payload = struct.pack('>f', duty_float)
-                self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-                await asyncio.sleep(self._command_interval)  # 10ms interval for smoother operation under load
+                # Ramp logic
+                if self._ramp_up_enabled:
+                    # Calculate step size for this interval
+                    max_step = self._ramp_up_rate * self._command_interval
+                    delta = self._target_power - self._current_power
+                    if abs(delta) > max_step:
+                        self._current_power += max_step if delta > 0 else -max_step
+                    else:
+                        self._current_power = self._target_power
+                else:
+                    self._current_power = self._target_power
+
+                # Duty cycle format selection
+                if self._duty_cycle_format == "float":
+                    payload = struct.pack('>f', self._current_power)
+                else:
+                    duty_int = int(self._current_power * 100000)
+                    payload = struct.pack('>i', duty_int)
+                self._send_packet(5, payload)
+                await asyncio.sleep(self._command_interval)
             except Exception as e:
                 self.logger.error(f"Simple power task error: {e}")
                 await asyncio.sleep(self._command_interval)

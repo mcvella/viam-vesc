@@ -1,6 +1,6 @@
 # VESC Motor Controller Module
 
-A Viam module for controlling VESC (Vedder Electronic Speed Controller) motor controllers, specifically designed for the Flipsky FSESC 4.12 and compatible VESC units.
+A Viam module for controlling VESC (Vedder Electronic Speed Controller) motor controllers, compatible with all VESC-based controllers. Tested with Flipsky FSESC 4.12, 75_300_R2, and other VESC hardware.
 
 ## Features
 
@@ -75,88 +75,55 @@ Common port patterns:
 }
 ```
 
+## Configuration Options
+
+- `duty_cycle_format` (optional):
+    - `int` (default): Use 32-bit integer for duty cycle (scaled by 100,000). Required for modern VESC firmware (e.g., 75_300_R2, VESC 6/7, FW 5.2+).
+    - `float`: Use 32-bit float for duty cycle (range -1.0 to 1.0). For legacy VESC firmware that expects float payloads.
+
+**Example:**
+```json
+{
+  "attributes": {
+    "port": "/dev/ttyACM0",
+    "duty_cycle_format": "float"  // Use only if your VESC firmware requires float
+  }
+}
+```
+
+If you are unsure, leave this option out (default is `int`).
+
 ### Supported Operations
 
 #### Basic Motor Control
 
-- `set_power(power)`: Set motor power as percentage (-1.0 to 1.0)
-- `set_rpm(rpm)`: Set motor RPM
-- `go_for(rpm, revolutions)`: Run motor for specific revolutions at given RPM
-- `go_to(rpm, position)`: Go to specific position at given RPM
-- `stop()`: Stop the motor
-- `reset_zero_position(offset)`: Reset zero position with offset
+- `
 
-#### Status Queries
+## Ramp-Up / Ramp-Down Behavior
 
-- `get_position()`: Get current position in revolutions
-- `is_powered()`: Check if motor is powered and get current power
-- `is_moving()`: Check if motor is moving
-- `get_properties()`: Get motor properties
+By default, the module ramps motor power smoothly to the target value instead of changing instantly. This is controlled by two parameters:
 
-### DoCommand
+- `ramp_up_enabled` (default: true): Enables ramping behavior.
+- `ramp_up_rate` (default: 0.1): Maximum change in power per second (e.g., 0.1 means it takes 10 seconds to go from 0 to 1.0 power).
+- `command_interval` (default: 0.01): How often the power is updated (in seconds).
 
-The VESC motor supports custom commands for advanced functionality:
+**Ramp Time Examples (with default settings):**
 
-#### Get VESC Telemetry
+| Target Power | Time to Reach |
+|--------------|--------------|
+| 1.0          | 10 seconds   |
+| 0.5          | 5 seconds    |
+| 0.2          | 2 seconds    |
+| 0.1          | 1 second     |
 
+**To make ramping faster, increase `ramp_up_rate` in your config.**
+
+**Example for 1 second ramp to full power:**
 ```json
 {
-  "command": "get_vesc_values"
+  "ramp_up_rate": 1.0,
+  "command_interval": 0.01
 }
 ```
 
-Returns VESC telemetry data including voltage, current, temperature, RPM, etc.
-
-#### Set Motor Current
-
-```json
-{
-  "command": "set_current",
-  "current": 10.5
-}
-```
-
-Sets the motor current in amperes (positive for forward, negative for reverse).
-
-### Hardware Setup
-
-#### Flipsky FSESC 4.12
-
-1. **Power Connection**: Connect battery to VESC power terminals
-2. **Motor Connection**: Connect motor phases to VESC motor terminals
-3. **Serial Connection**: Connect USB-to-serial adapter to VESC UART pins
-4. **Configuration**: Use VESC Tool to configure motor parameters
-
-#### Serial Pinout
-
-- **TX**: Connect to VESC RX pin
-- **RX**: Connect to VESC TX pin
-- **GND**: Connect to VESC GND pin
-
-### Troubleshooting
-
-#### Common Issues
-
-1. **Connection Failed**: Check serial port path and permissions
-2. **No Response**: Verify baudrate matches VESC configuration
-3. **CRC Errors**: Check wiring and ensure proper voltage levels
-4. **Motor Not Moving**: Verify motor connections and VESC configuration
-
-#### Debug Mode
-
-Enable debug logging by running viam-server with the `--debug` flag:
-
-```bash
-viam-server --debug
-```
-
-### Safety Notes
-
-- Always ensure proper motor configuration in VESC Tool before use
-- Monitor motor temperature and current during operation
-- Use appropriate current limits for your motor
-- Ensure proper power supply voltage and current capacity
-
-### License
-
-This module is licensed under the same license as the Viam SDK.
+Set `ramp_up_enabled` to `false` to disable ramping and change power instantly.
