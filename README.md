@@ -215,6 +215,8 @@ This repo is set up for [Viam cloud build](https://docs.viam.com/build-modules/m
 1. Push your changes, then create a GitHub Release (tag like `0.2.0`).
 2. The workflow runs cloud builds for `linux/amd64`, `linux/arm64`, and `darwin/arm64` and uploads them to the registry.
 
+`build.sh` packages the full `python-can` (SocketCAN) backend into the PyInstaller binary. If you see `No module named 'can.interfaces.socketcan'`, publish a new release that includes that change (or point the machine at a local `./run.sh` module after `setup.sh`).
+
 **Local build smoke test**
 
 ```sh

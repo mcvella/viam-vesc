@@ -9,6 +9,13 @@ if ! $PYTHON -m pip install pyinstaller -Uqq; then
     exit 1
 fi
 
-$PYTHON -m PyInstaller --onefile --collect-all viam --hidden-import="googleapiclient" src/main.py
+# python-can loads backends like socketcan dynamically; collect the whole package
+# or the frozen module cannot open SocketCAN.
+$PYTHON -m PyInstaller --onefile \
+  --collect-all viam \
+  --collect-all can \
+  --hidden-import=can.interfaces.socketcan \
+  --hidden-import=googleapiclient \
+  src/main.py
 chmod +x dist/main 2>/dev/null || true
 tar -czvf dist/archive.tar.gz ./dist/main

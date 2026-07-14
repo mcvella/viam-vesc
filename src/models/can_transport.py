@@ -43,6 +43,17 @@ class CanTransport(VescTransport):
         self._listen_thread: Optional[threading.Thread] = None
 
     def open(self) -> None:
+        try:
+            import can.interfaces.socketcan  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "SocketCAN backend is unavailable. On a registry/cloud-built "
+                "module this usually means python-can was not fully packaged; "
+                "rebuild with --collect-all can. For a local module, ensure "
+                "python-can is installed in the venv (re-run setup.sh) and you "
+                "are on Linux."
+            ) from e
+
         # Filter for extended frames from this VESC ID (any command in bits 15-8).
         # Mask 0xFF matches the low 8 bits (controller id).
         self.bus = can.Bus(
