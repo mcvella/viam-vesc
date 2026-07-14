@@ -1,0 +1,19 @@
+# Triggers a Viam cloud build + registry publish on release.
+# See https://github.com/viamrobotics/build-action
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: viamrobotics/build-action@v1
+        with:
+          # Use version: "" to test the build without deploying
+          version: ${{ github.ref_name }}
+          ref: ${{ github.sha }}
+          key-id: ${{ secrets.viam_key_id }}
+          key-value: ${{ secrets.viam_key_value }}
+          token: ${{ github.token }}

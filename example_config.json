@@ -5,9 +5,30 @@
       "type": "motor",
       "model": "mcvella:vesc:vesc",
       "attributes": {
+        "transport": "serial",
         "port": "/dev/ttyACM0",
         "baudrate": 115200,
         "timeout": 1.0
+      }
+    },
+    {
+      "name": "left",
+      "type": "motor",
+      "model": "mcvella:vesc:vesc",
+      "attributes": {
+        "transport": "can",
+        "interface": "can0",
+        "id": 1
+      }
+    },
+    {
+      "name": "right",
+      "type": "motor",
+      "model": "mcvella:vesc:vesc",
+      "attributes": {
+        "transport": "can",
+        "interface": "can0",
+        "id": 2
       }
     }
   ],
@@ -18,4 +39,4 @@
       "type": "local"
     }
   ]
-} 
+}

@@ -9,5 +9,6 @@ if ! $PYTHON -m pip install pyinstaller -Uqq; then
     exit 1
 fi
 
-$PYTHON -m PyInstaller --onefile --hidden-import="googleapiclient" src/main.py
+$PYTHON -m PyInstaller --onefile --collect-all viam --hidden-import="googleapiclient" src/main.py
+chmod +x dist/main 2>/dev/null || true
 tar -czvf dist/archive.tar.gz ./dist/main

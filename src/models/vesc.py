@@ -1,11 +1,8 @@
 import asyncio
-import struct
-import time
 from dataclasses import dataclass
-from typing import (Any, ClassVar, Dict, Final, List, Mapping, Optional,
-                    Sequence, Tuple)
+from typing import (Any, ClassVar, Dict, List, Mapping, Optional, Sequence,
+                    Tuple)
 
-import serial
 from typing_extensions import Self
 from viam.components.motor import *
 from viam.proto.app.robot import ComponentConfig
@@ -15,34 +12,17 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
+from .transport import VescTransport, create_transport, validate_transport_attributes
+
 
 class Vesc(Motor, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug option,
     # or configure your resource/machine to display debug logs.
     MODEL: ClassVar[Model] = Model(ModelFamily("mcvella", "vesc"), "vesc")
 
-    # Standard VESC packet IDs (using more conservative values)
-    COMM_FW_VERSION = 0x32
-    COMM_JUMP_TO_BOOTLOADER = 0x33
-    COMM_ERASE_NEW_APP = 0x34
-    COMM_WRITE_NEW_APP_DATA = 0x35
-    COMM_GET_VALUES = 0x27
-    COMM_SET_DUTY = 5
-    COMM_SET_CURRENT = 0x01
-    COMM_SET_CURRENT_BRAKE = 0x02
-    COMM_SET_RPM = 0x03
-    COMM_SET_POS = 0x04
-    COMM_SET_HANDBRAKE = 0x05
-    COMM_SET_DETECT = 0x06
-    COMM_SET_SERVO_POS = 0x07
-    COMM_ALIVE = 0x3A
-
     def __init__(self, name: str):
         super().__init__(name)
-        self.serial_port = None
-        self.port = None
-        self.baudrate = 115200
-        self.timeout = 1.0
+        self._transport: Optional[VescTransport] = None
         self._is_powered = False
         self._current_power = 0.0
         self._current_rpm = 0.0
@@ -55,10 +35,11 @@ class Vesc(Motor, EasyResource):
         self._stop_power_task = False
         self._command_interval = 0.01  # 10ms default, configurable
         self._ramp_up_enabled = True
-        self._ramp_up_rate = 0.1  # Power change per second
+        self._ramp_up_rate = 0.25  # Power change per second
         self._current_ramp_power = 0.0
-        self._direction_change_in_progress = False  # Add direction change lock
+        self._direction_change_in_progress = False
         self._duty_cycle_format = "int"
+        self._transport_name = "serial"
 
     @classmethod
     def new(
@@ -93,6 +74,8 @@ class Vesc(Motor, EasyResource):
                 first element is a list of required dependencies and the
                 second element is a list of optional dependencies
         """
+        attributes = struct_to_dict(config.attributes)
+        validate_transport_attributes(attributes)
         return [], []
 
     def reconfigure(
@@ -104,203 +87,64 @@ class Vesc(Motor, EasyResource):
             config (ComponentConfig): The new configuration
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both required and optional)
         """
-        if self.serial_port:
-            self.serial_port.close()
-        
-        # Get configuration using struct_to_dict for cleaner access
+        # Sync path: cancel the keepalive task, then swap transports.
+        self._stop_power_task = True
+        if self._power_task and not self._power_task.done():
+            self._power_task.cancel()
+        self._power_task = None
+
+        old_transport = self._transport
+        self._transport = None
+        if old_transport:
+            old_transport.close()
+
         attributes = struct_to_dict(config.attributes)
-        
-        # Set up VESC configuration with defaults
-        self.port = str(attributes.get("port", "/dev/ttyACM0"))
-        self.baudrate = int(attributes.get("baudrate", 115200))
-        self.timeout = float(attributes.get("timeout", 1.0))
+
         self._debug_mode = bool(attributes.get("debug", True))
-        self._command_interval = float(attributes.get("command_interval", 0.01))  # Configurable command interval
+        self._command_interval = float(attributes.get("command_interval", 0.01))
         self._ramp_up_enabled = bool(attributes.get("ramp_up_enabled", True))
-        self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.1))
+        self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.25))
         self._duty_cycle_format = attributes.get("duty_cycle_format", "int")
-        
-        # Initialize serial connection
+        self._transport_name = str(attributes.get("transport", "serial")).lower()
+
         try:
-            self.serial_port = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=self.timeout,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE
-            )
-            self.logger.info(f"Connected to VESC on {self.port} at {self.baudrate} baud")
-            
-            # Test connection
-            if self._test_connection():
+            self._transport = create_transport(attributes, self.logger)
+            self._transport.open()
+
+            if self._transport.test_connection():
                 self.logger.info("VESC connection test successful")
             else:
-                self.logger.warning("VESC connection test failed - motor may not respond")
-                
+                self.logger.warning(
+                    "VESC connection test failed - motor may not respond"
+                )
         except Exception as e:
             self.logger.error(f"Failed to connect to VESC: {e}")
+            if self._transport:
+                self._transport.close()
+                self._transport = None
             raise
 
-    def _test_connection(self) -> bool:
-        """Test basic VESC connection"""
-        try:
-            # Try to get VESC values
-            if self._send_simple_command(self.COMM_GET_VALUES):
-                time.sleep(0.1)
-                response = self._read_response()
-                return response is not None
-            return False
-        except Exception as e:
-            self.logger.error(f"Connection test failed: {e}")
-            return False
+    def _require_transport(self) -> VescTransport:
+        if not self._transport:
+            raise RuntimeError("VESC transport not open")
+        return self._transport
 
-    def _crc16(self, data: bytes) -> int:
-        """Calculate CRC16 for VESC packet"""
-        crc = 0
-        for byte in data:
-            crc ^= byte << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-                else:
-                    crc = (crc << 1) & 0xFFFF
-        return crc
-
-    def _pack_payload(self, payload: bytes) -> bytes:
-        """Pack payload with VESC protocol framing"""
-        if len(payload) <= 256:
-            header = struct.pack('BB', 2, len(payload))  # Short packet
-        else:
-            header = struct.pack('BBB', 3, len(payload) >> 8, len(payload) & 0xFF)  # Long packet
-        
-        crc = self._crc16(payload)
-        crc_bytes = struct.pack('>H', crc)
-        packet = header + payload + crc_bytes + b'\x03'
-        return packet
-
-    def _send_packet(self, command_id: int, payload: bytes = b'') -> bool:
-        """Send a packet to the VESC using the working protocol"""
-        if not self.serial_port or not self.serial_port.is_open:
-            self.logger.error("Serial port not open")
-            return False
-        
-        try:
-            # Clear input buffer before sending
-            self.serial_port.reset_input_buffer()
-            
-            # Create the full payload with command ID
-            full_payload = struct.pack('B', command_id) + payload
-            packet = self._pack_payload(full_payload)
-            
-            if self._debug_mode:
-                self.logger.debug(f"Sending packet: command_id={command_id}, payload={payload.hex()}, full_packet={packet.hex()}")
-            
-            # Clear output buffer and send
-            self.serial_port.reset_output_buffer()
-            self.serial_port.write(packet)
-            self.serial_port.flush()
-            
-            # Small delay to ensure command is processed
-            time.sleep(0.001)
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to send packet: {e}")
-            return False
-
-    def _send_simple_command(self, command_id: int, payload: bytes = b'') -> bool:
-        """Send a simple VESC command with basic packet structure"""
-        if not self.serial_port or not self.serial_port.is_open:
-            self.logger.error("Serial port not open")
-            return False
-        
-        try:
-            # Simple packet structure: [START][LEN][PAYLOAD][CRC][END]
-            # START = 0x02, END = 0x03
-            packet = struct.pack('B', 0x02)  # START
-            packet += struct.pack('B', len(payload) + 1)  # LEN (including command ID)
-            packet += struct.pack('B', command_id)  # Command ID
-            packet += payload  # Payload
-            
-            # Calculate CRC
-            crc_data = packet[1:]  # Everything after START
-            crc = self._crc16(crc_data)
-            packet += struct.pack('>H', crc)
-            packet += struct.pack('B', 0x03)  # END
-            
-            if self._debug_mode:
-                self.logger.debug(f"Sending packet: {packet.hex()}")
-            
-            self.serial_port.write(packet)
-            self.serial_port.flush()
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to send command: {e}")
-            return False
-
-    def _read_response(self, timeout: float = 0.1) -> Optional[bytes]:
-        """Read response from VESC with timeout"""
-        if not self.serial_port or not self.serial_port.is_open:
-            return None
-        
-        try:
-            # Set temporary timeout
-            original_timeout = self.serial_port.timeout
-            self.serial_port.timeout = timeout
-            
-            # Read START byte
-            start = self.serial_port.read(1)
-            if not start or start[0] != 0x02:
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            # Read length
-            length_bytes = self.serial_port.read(1)
-            if not length_bytes:
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            length = length_bytes[0]
-            
-            # Read payload
-            payload = self.serial_port.read(length)
-            if len(payload) != length:
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            # Read CRC
-            crc_bytes = self.serial_port.read(2)
-            if len(crc_bytes) != 2:
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            # Read END byte
-            end = self.serial_port.read(1)
-            if not end or end[0] != 0x03:
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            # Verify CRC
-            received_crc = struct.unpack('>H', crc_bytes)[0]
-            calculated_crc = self._crc16(struct.pack('B', length) + payload)
-            
-            if received_crc != calculated_crc:
-                self.logger.error(f"CRC mismatch: received {received_crc}, calculated {calculated_crc}")
-                self.serial_port.timeout = original_timeout
-                return None
-            
-            # Restore original timeout
-            self.serial_port.timeout = original_timeout
-            
-            if self._debug_mode:
-                self.logger.debug(f"Received response: {payload.hex()}")
-            
-            return payload
-            
-        except Exception as e:
-            self.logger.error(f"Failed to read response: {e}")
-            return None
+    async def _halt_power_task(self) -> None:
+        """Stop the keepalive/ramp task without holding `_lock` during the await."""
+        async with self._lock:
+            self._stop_power_task = True
+            task = self._power_task
+            self._power_task = None
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     @dataclass
     class Properties(Motor.Properties):
@@ -315,32 +159,20 @@ class Vesc(Motor, EasyResource):
         **kwargs
     ):
         """Set motor power as a percentage (-1.0 to 1.0)"""
+        power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
+        await self._halt_power_task()
+
         async with self._lock:
-            power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
-            
-            # Stop any existing power task
-            if self._power_task and not self._power_task.done():
-                self._stop_power_task = True
-                try:
-                    await asyncio.wait_for(self._power_task, timeout=0.5)
-                except asyncio.TimeoutError:
-                    pass
-                self._power_task = None
-            
+            transport = self._require_transport()
+
             # Update state
             self._target_power = power
             self._is_powered = power != 0.0
             self._current_power = power
             self._is_moving = power != 0.0
-            
-            # Duty cycle format selection
-            if self._duty_cycle_format == "float":
-                payload = struct.pack('>f', self._target_power)
-            else:
-                duty_int = int(self._target_power * 100000)
-                payload = struct.pack('>i', duty_int)
-            self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-            
+
+            transport.set_duty(self._target_power)
+
             if power != 0.0:
                 # Start simple timer task to keep motor running
                 self._stop_power_task = False
@@ -359,45 +191,41 @@ class Vesc(Motor, EasyResource):
         **kwargs
     ):
         """Go for a specific number of revolutions at a given RPM"""
+        if revolutions == 0:
+            await self.stop()
+            return
+
+        success = False
+        time_needed = 0.0
         async with self._lock:
-            if revolutions == 0:
-                await self.stop()
-                return
-            
-            # Try RPM control
-            success = False
+            transport = self._require_transport()
             try:
-                payload = struct.pack('>i', int(rpm))
-                if self._send_simple_command(self.COMM_SET_RPM, payload):
+                if transport.set_rpm(rpm):
                     success = True
                     self.logger.info(f"Set RPM to {rpm}")
             except Exception as e:
                 self.logger.debug(f"RPM control failed: {e}")
-            
+
             if success:
                 self._current_rpm = rpm
                 self._is_powered = True
                 self._is_moving = True
-                
-                # Calculate time needed for the revolutions
                 if rpm != 0:
-                    time_needed = abs(revolutions / rpm) * 60.0  # Convert to seconds
-                    
-                    # Wait for the specified time
-                    await asyncio.sleep(time_needed)
-                    
-                    # Stop the motor
-                    await self.stop()
-                    
-                    # Update position
-                    self._position += revolutions
-            else:
-                # Fallback to power control
-                self.logger.warning("RPM control failed, using power control fallback")
-                power = 0.5 if rpm > 0 else -0.5
-                await self.set_power(power)
-                await asyncio.sleep(2.0)  # Run for 2 seconds
+                    time_needed = abs(revolutions / rpm) * 60.0
+
+        if success:
+            if rpm != 0:
+                await asyncio.sleep(time_needed)
                 await self.stop()
+                async with self._lock:
+                    self._position += revolutions
+            return
+
+        self.logger.warning("RPM control failed, using power control fallback")
+        power = 0.5 if rpm > 0 else -0.5
+        await self.set_power(power)
+        await asyncio.sleep(2.0)
+        await self.stop()
 
     async def go_to(
         self,
@@ -412,7 +240,7 @@ class Vesc(Motor, EasyResource):
         target_position = position_revolutions
         current_position = self._position
         revolutions_needed = target_position - current_position
-        
+
         await self.go_for(rpm, revolutions_needed, extra=extra, timeout=timeout, **kwargs)
 
     async def set_rpm(
@@ -426,8 +254,8 @@ class Vesc(Motor, EasyResource):
         """Set the motor RPM"""
         async with self._lock:
             try:
-                payload = struct.pack('>i', int(rpm))
-                if self._send_simple_command(self.COMM_SET_RPM, payload):
+                transport = self._require_transport()
+                if transport.set_rpm(rpm):
                     self._current_rpm = rpm
                     self._is_powered = rpm != 0.0
                     self._is_moving = rpm != 0.0
@@ -479,24 +307,11 @@ class Vesc(Motor, EasyResource):
         **kwargs
     ):
         """Stop the motor"""
+        await self._halt_power_task()
+
         async with self._lock:
-            # Stop background power task
-            if self._power_task and not self._power_task.done():
-                self._stop_power_task = True
-                try:
-                    await asyncio.wait_for(self._power_task, timeout=0.5)
-                except asyncio.TimeoutError:
-                    pass
-                self._power_task = None
-            
-            # Duty cycle format selection
-            if self._duty_cycle_format == "float":
-                payload = struct.pack('>f', 0.0)
-            else:
-                payload = struct.pack('>i', 0)
-            self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-            
-            # Update state
+            self._require_transport().set_duty(0.0)
+
             self._target_power = 0.0
             self._is_powered = False
             self._current_power = 0.0
@@ -512,7 +327,8 @@ class Vesc(Motor, EasyResource):
         **kwargs
     ) -> Tuple[bool, float]:
         """Check if the motor is powered and return current power"""
-        return self._is_powered, self._current_power
+        async with self._lock:
+            return self._is_powered, self._current_power
 
     async def is_moving(self) -> bool:
         """Check if the motor is moving"""
@@ -527,140 +343,147 @@ class Vesc(Motor, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         """Handle custom commands"""
         command_name = command.get("command")
-        
+        transport = self._transport
+
         if command_name == "get_vesc_values":
-            # Get VESC telemetry values
-            if self._send_simple_command(self.COMM_GET_VALUES):
-                payload = self._read_response()
-                if payload:
-                    return {"status": "success", "data": payload.hex()}
-                else:
-                    return {"status": "error", "message": "Failed to read VESC values"}
+            if not transport:
+                return {"status": "error", "message": "Transport not open"}
+            status = transport.get_status()
+            if status is None:
+                return {"status": "error", "message": "Failed to read VESC values"}
+            result: Dict[str, Any] = {"status": "success"}
+            if status.raw_hex is not None:
+                result["data"] = status.raw_hex
             else:
-                return {"status": "error", "message": "Failed to request VESC values"}
-        
+                result.update(status.as_dict())
+            return result
+
         elif command_name == "set_current":
-            # Set motor current
+            if not transport:
+                return {"status": "error", "message": "Transport not open"}
             current = command.get("current", 0.0)
             if isinstance(current, (int, float)):
-                payload = struct.pack('>f', float(current))
-                if self._send_simple_command(self.COMM_SET_CURRENT, payload):
+                if transport.set_current(float(current)):
                     return {"status": "success", "current": current}
-                else:
-                    return {"status": "error", "message": "Failed to set current"}
-            else:
-                return {"status": "error", "message": "Invalid current value"}
-        
+                return {"status": "error", "message": "Failed to set current"}
+            return {"status": "error", "message": "Invalid current value"}
+
         elif command_name == "test_connection":
-            # Test VESC connection
-            if self._test_connection():
+            if not transport:
+                return {"status": "error", "message": "Transport not open"}
+            if transport.test_connection():
                 return {"status": "success", "message": "VESC connection test passed"}
-            else:
-                return {"status": "error", "message": "VESC connection test failed"}
-        
+            return {"status": "error", "message": "VESC connection test failed"}
+
         elif command_name == "ping":
-            # Send ALIVE command
-            if self._send_simple_command(self.COMM_ALIVE):
-                payload = self._read_response()
-                if payload:
-                    return {"status": "success", "response": payload.hex()}
-                else:
-                    return {"status": "error", "message": "No response to ping"}
-            else:
-                return {"status": "error", "message": "Failed to send ping"}
-        
+            if not transport:
+                return {"status": "error", "message": "Transport not open"}
+            if transport.ping():
+                return {"status": "success", "message": "Ping sent"}
+            return {"status": "error", "message": "Failed to send ping"}
+
         elif command_name == "set_debug":
-            # Enable/disable debug mode
             debug = command.get("debug", False)
             self._debug_mode = bool(debug)
+            if transport:
+                transport.set_debug(self._debug_mode)
             return {"status": "success", "debug_mode": self._debug_mode}
-        
+
         elif command_name == "get_status":
-            # Get current motor status
-            return {
+            result = {
                 "status": "success",
                 "is_powered": self._is_powered,
                 "current_power": self._current_power,
                 "current_rpm": self._current_rpm,
                 "is_moving": self._is_moving,
                 "position": self._position,
-                "debug_mode": self._debug_mode
+                "debug_mode": self._debug_mode,
+                "transport": self._transport_name,
             }
-        
+            if transport:
+                vesc_status = transport.get_status()
+                if vesc_status is not None and vesc_status.raw_hex is None:
+                    result["vesc"] = vesc_status.as_dict()
+            return result
+
         elif command_name == "set_command_interval":
-            # Set command interval for testing different frequencies
             interval = command.get("interval", 0.01)
             if isinstance(interval, (int, float)) and 0.001 <= interval <= 0.1:
                 self._command_interval = float(interval)
                 return {"status": "success", "command_interval": self._command_interval}
-            else:
-                return {"status": "error", "message": "Invalid interval (must be between 0.001 and 0.1 seconds)"}
-        
+            return {
+                "status": "error",
+                "message": "Invalid interval (must be between 0.001 and 0.1 seconds)",
+            }
+
         elif command_name == "set_ramp_up":
-            # Enable/disable ramp-up
             enabled = command.get("enabled", True)
             self._ramp_up_enabled = bool(enabled)
             return {"status": "success", "ramp_up_enabled": self._ramp_up_enabled}
-        
+
         elif command_name == "set_ramp_rate":
-            # Set ramp-up rate
-            rate = command.get("rate", 0.1)
+            rate = command.get("rate", 0.25)
             if isinstance(rate, (int, float)) and 0.01 <= rate <= 1.0:
                 self._ramp_up_rate = float(rate)
                 return {"status": "success", "ramp_up_rate": self._ramp_up_rate}
-            else:
-                return {"status": "error", "message": "Invalid rate (must be between 0.01 and 1.0 power/second)"}
-        
+            return {
+                "status": "error",
+                "message": "Invalid rate (must be between 0.01 and 1.0 power/second)",
+            }
+
         elif command_name == "get_ramp_status":
-            # Get current ramp-up status
             return {
                 "status": "success",
                 "ramp_up_enabled": self._ramp_up_enabled,
                 "ramp_up_rate": self._ramp_up_rate,
                 "current_ramp_power": self._current_ramp_power,
-                "target_power": self._target_power
+                "target_power": self._target_power,
             }
-        
+
         elif command_name == "force_stop":
-            # Force stop the motor and reset all state
+            await self._halt_power_task()
+            # Send stop under the lock with no awaits so reconfigure()/close()
+            # cannot close the transport between state reset and device commands.
             async with self._lock:
-                # Stop power task
-                if self._power_task and not self._power_task.done():
-                    self._stop_power_task = True
-                    try:
-                        await asyncio.wait_for(self._power_task, timeout=0.5)
-                    except asyncio.TimeoutError:
-                        pass
-                    self._power_task = None
-                
-                # Send multiple stop commands
+                active_transport = self._transport
+                if active_transport is None:
+                    return {
+                        "status": "error",
+                        "message": "Transport not open; cannot force stop VESC",
+                    }
+                sent_ok = 0
                 for _ in range(5):
-                    if self._duty_cycle_format == "float":
-                        payload = struct.pack('>f', 0.0)
-                    else:
-                        payload = struct.pack('>i', 0)
-                    self._send_packet(5, payload)  # COMM_SET_DUTY = 5
-                    await asyncio.sleep(0.02)
-                
-                # Reset all state
+                    if active_transport.set_duty(0.0):
+                        sent_ok += 1
+                if sent_ok == 0:
+                    return {
+                        "status": "error",
+                        "message": (
+                            "Failed to send stop commands to VESC; "
+                            "device may still be running"
+                        ),
+                    }
                 self._target_power = 0.0
                 self._is_powered = False
                 self._current_power = 0.0
                 self._current_rpm = 0.0
                 self._is_moving = False
                 self._current_ramp_power = 0.0
-                
-                return {"status": "success", "message": "Motor force stopped and state reset"}
-        
+            return {
+                "status": "success",
+                "message": "Motor force stopped and state reset",
+            }
+
         elif command_name == "clear_buffers":
-            # Clear all serial buffers
-            if self.serial_port:
-                self.serial_port.reset_input_buffer()
-                self.serial_port.reset_output_buffer()
+            if not transport:
+                return {"status": "error", "message": "Transport not open"}
+            if transport.clear_buffers():
                 return {"status": "success", "message": "Serial buffers cleared"}
-            else:
-                return {"status": "error", "message": "Serial port not open"}
-        
+            return {
+                "status": "error",
+                "message": "Buffer clear not supported or transport not open",
+            }
+
         else:
             return {"status": "error", "message": f"Unknown command: {command_name}"}
 
@@ -670,30 +493,43 @@ class Vesc(Motor, EasyResource):
         """Get the geometries of the motor"""
         return []
 
+    async def close(self):
+        await self._halt_power_task()
+        async with self._lock:
+            transport = self._transport
+            self._transport = None
+        if transport:
+            transport.close()
+
     async def _simple_power_task(self):
-        while not self._stop_power_task:
+        while True:
             try:
-                # Ramp logic
-                if self._ramp_up_enabled:
-                    # Calculate step size for this interval
-                    max_step = self._ramp_up_rate * self._command_interval
-                    delta = self._target_power - self._current_power
-                    if abs(delta) > max_step:
-                        self._current_power += max_step if delta > 0 else -max_step
+                async with self._lock:
+                    if self._stop_power_task:
+                        return
+                    if self._ramp_up_enabled:
+                        max_step = self._ramp_up_rate * self._command_interval
+                        delta = self._target_power - self._current_power
+                        if abs(delta) > max_step:
+                            self._current_power += (
+                                max_step if delta > 0 else -max_step
+                            )
+                        else:
+                            self._current_power = self._target_power
                     else:
                         self._current_power = self._target_power
-                else:
-                    self._current_power = self._target_power
 
-                # Duty cycle format selection
-                if self._duty_cycle_format == "float":
-                    payload = struct.pack('>f', self._current_power)
-                else:
-                    duty_int = int(self._current_power * 100000)
-                    payload = struct.pack('>i', duty_int)
-                self._send_packet(5, payload)
-                await asyncio.sleep(self._command_interval)
+                    # Snapshot under the lock so close/reconfigure cannot swap
+                    # transport out from under a mid-flight set_duty call.
+                    transport = self._transport
+                    duty = self._current_power
+                    interval = self._command_interval
+
+                if transport is not None:
+                    transport.set_duty(duty)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.logger.error(f"Simple power task error: {e}")
                 await asyncio.sleep(self._command_interval)
-

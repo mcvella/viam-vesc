@@ -4,39 +4,96 @@ A Viam module for controlling VESC (Vedder Electronic Speed Controller) motor co
 
 ## Features
 
-- **Direct Serial Communication**: Uses direct serial commands for reliable communication
+- **Serial or SocketCAN**: Choose UART/USB serial (default) or Linux SocketCAN
+- **Multi-motor CAN**: Address multiple VESC controllers on one bus by controller `id`
 - **Motor Control**: Full motor control including power, RPM, position, and current control
-- **Telemetry**: Access to VESC telemetry data
-- **Safety Features**: Proper CRC checking and error handling
+- **Telemetry**: Access to VESC telemetry data (serial `COMM_GET_VALUES` or CAN status frames)
+- **Safety Features**: Proper CRC checking (serial) and error handling
 - **Async Support**: Full async/await support for non-blocking operations
 
 ## Model mcvella:vesc:vesc
 
-A motor component that interfaces with VESC motor controllers via serial communication.
+A motor component that interfaces with VESC motor controllers via serial or SocketCAN.
 
 ### Configuration
 
-The following attribute template can be used to configure this model:
+Use `transport` to select the I/O backend (`serial` default, or `can`).
+
+#### Serial (default)
 
 ```json
 {
+  "transport": "serial",
   "port": "/dev/ttyUSB0",
   "baudrate": 115200,
   "timeout": 1.0
 }
 ```
 
-#### Attributes
-
-The following attributes are available for this model:
-
 | Name       | Type   | Inclusion | Default        | Description                                    |
 |------------|--------|-----------|----------------|------------------------------------------------|
+| `transport`| string | Optional  | `"serial"`     | `"serial"` or `"can"`                          |
 | `port`     | string | Optional  | "/dev/ttyACM0" | Serial port path (see port detection guide below) |
 | `baudrate` | int    | Optional  | 115200         | Serial communication baudrate                  |
 | `timeout`  | float  | Optional  | 1.0            | Serial communication timeout in seconds        |
 
-#### Port Detection
+#### SocketCAN
+
+```json
+{
+  "transport": "can",
+  "interface": "can0",
+  "id": 1
+}
+```
+
+| Name        | Type   | Inclusion | Default | Description                                      |
+|-------------|--------|-----------|---------|--------------------------------------------------|
+| `transport` | string | Required  | —       | Must be `"can"`                                  |
+| `interface` | string | Required  | —       | Linux CAN device (e.g. `can0`)                   |
+| `id`        | int    | Required  | —       | VESC controller ID on the bus (0–255)            |
+
+CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VESC CAN protocol](https://github.com/vedderb/bldc/blob/master/documentation/comm_can.md) and the [erh/vesccan](https://github.com/erh/vesccan) reference module.
+
+**SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
+
+```bash
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set up can0
+```
+
+#### Two motors on one CAN bus
+
+```json
+{
+  "components": [
+    {
+      "name": "left",
+      "type": "motor",
+      "model": "mcvella:vesc:vesc",
+      "attributes": {
+        "transport": "can",
+        "interface": "can0",
+        "id": 1
+      }
+    },
+    {
+      "name": "right",
+      "type": "motor",
+      "model": "mcvella:vesc:vesc",
+      "attributes": {
+        "transport": "can",
+        "interface": "can0",
+        "id": 2
+      }
+    }
+  ]
+}
+```
+
+Each component opens its own SocketCAN socket filtered by `id`.
+
+#### Port Detection (serial)
 
 To find the correct serial port for your VESC:
 
@@ -60,7 +117,7 @@ Common port patterns:
 - macOS: `/dev/tty.usbserial-0001`, `/dev/tty.usbmodem14101`
 - Windows: `COM3`, `COM4`
 
-#### Example Configuration
+#### Example Configuration (serial)
 
 ```json
 {
@@ -77,7 +134,7 @@ Common port patterns:
 
 ## Configuration Options
 
-- `duty_cycle_format` (optional):
+- `duty_cycle_format` (optional, serial only):
     - `int` (default): Use 32-bit integer for duty cycle (scaled by 100,000). Required for modern VESC firmware (e.g., 75_300_R2, VESC 6/7, FW 5.2+).
     - `float`: Use 32-bit float for duty cycle (range -1.0 to 1.0). For legacy VESC firmware that expects float payloads.
 
@@ -86,44 +143,82 @@ Common port patterns:
 {
   "attributes": {
     "port": "/dev/ttyACM0",
-    "duty_cycle_format": "float"  // Use only if your VESC firmware requires float
+    "duty_cycle_format": "float"
   }
 }
 ```
 
-If you are unsure, leave this option out (default is `int`).
-
-### Supported Operations
-
-#### Basic Motor Control
-
-- `
+If you are unsure, leave this option out (default is `int`). CAN always uses the integer scaled duty format.
 
 ## Ramp-Up / Ramp-Down Behavior
 
-By default, the module ramps motor power smoothly to the target value instead of changing instantly. This is controlled by two parameters:
+By default, the module ramps motor power toward the new target instead of jumping instantly.
 
-- `ramp_up_enabled` (default: true): Enables ramping behavior.
-- `ramp_up_rate` (default: 0.1): Maximum change in power per second (e.g., 0.1 means it takes 10 seconds to go from 0 to 1.0 power).
-- `command_interval` (default: 0.01): How often the power is updated (in seconds).
+| Attribute | Default | Meaning |
+|-----------|---------|---------|
+| `ramp_up_enabled` | `true` | When `false`, power changes immediately. |
+| `ramp_up_rate` | `0.25` | Max change in power **per second** (power is −1.0…1.0). |
+| `command_interval` | `0.01` | How often the keepalive/ramp loop ticks (seconds). Does **not** set total ramp time. |
 
-**Ramp Time Examples (with default settings):**
+**Time to finish a ramp:**
 
-| Target Power | Time to Reach |
-|--------------|--------------|
-| 1.0          | 10 seconds   |
-| 0.5          | 5 seconds    |
-| 0.2          | 2 seconds    |
-| 0.1          | 1 second     |
-
-**To make ramping faster, increase `ramp_up_rate` in your config.**
-
-**Example for 1 second ramp to full power:**
-```json
-{
-  "ramp_up_rate": 1.0,
-  "command_interval": 0.01
-}
+```text
+seconds ≈ |new_power − current_power| / ramp_up_rate
 ```
 
-Set `ramp_up_enabled` to `false` to disable ramping and change power instantly.
+With the default `ramp_up_rate` of `0.25`:
+
+| Power change | Approximate time |
+|--------------|------------------|
+| 0 → 1.0 (full) | 4 s |
+| 0 → 0.5 | 2 s |
+| −0.5 → 0.5 | 4 s |
+
+Faster ramp → higher `ramp_up_rate`. Slower ramp → lower `ramp_up_rate`.
+
+**Examples:**
+
+```json
+{
+  "ramp_up_rate": 1.0
+}
+```
+≈ 1 second for a full 0 → 1.0 change.
+
+```json
+{
+  "ramp_up_rate": 0.2
+}
+```
+≈ 5 seconds for a full 0 → 1.0 change.
+
+```json
+{
+  "ramp_up_enabled": false
+}
+```
+Disable ramping; apply the new power immediately.
+
+## Publishing (Viam cloud build)
+
+This repo is set up for [Viam cloud build](https://docs.viam.com/build-modules/manage-modules/) via [`.github/workflows/viam-build.yml`](.github/workflows/viam-build.yml).
+
+**One-time setup**
+
+1. Create an org API key: `viam organizations api-key create --org-id <org-id> --name viam-vesc-cloud-build`
+2. In the GitHub repo, add Actions secrets:
+   - `viam_key_id`
+   - `viam_key_value`
+
+**Publish a version**
+
+1. Push your changes, then create a GitHub Release (tag like `0.2.0`).
+2. The workflow runs cloud builds for `linux/amd64`, `linux/arm64`, and `darwin/arm64` and uploads them to the registry.
+
+**Local build smoke test**
+
+```sh
+viam module build local
+```
+
+For local machine testing without packaging, keep using `./run.sh` in your machine config (as in `example_config.json`). Registry uploads use the PyInstaller binary `dist/main`.

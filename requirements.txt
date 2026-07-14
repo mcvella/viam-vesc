@@ -3,3 +3,4 @@ viam-sdk==0.48.0
 typing-extensions
 
 pyserial
+python-can

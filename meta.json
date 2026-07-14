@@ -3,28 +3,28 @@
   "module_id": "mcvella:vesc",
   "visibility": "public",
   "url": "https://github.com/mcvella/viam-vesc",
-  "description": "VESC motor controller module for Flipsky FSESC 4.12 and compatible VESC units",
+  "description": "VESC motor controller module supporting serial UART and SocketCAN for Flipsky FSESC and compatible VESC units",
   "models": [
     {
       "api": "rdk:component:motor",
       "model": "mcvella:vesc:vesc",
-      "short_description": "VESC motor controller with direct serial communication",
+      "short_description": "VESC motor controller over serial or SocketCAN with per-controller ID addressing",
       "markdown_link": "README.md#model-mcvellavescvesc"
     }
   ],
   "applications": null,
   "markdown_link": "README.md",
-  "entrypoint": "./run.sh",
+  "entrypoint": "dist/main",
   "first_run": "",
   "build": {
-    "build": "./build.sh",
     "setup": "./setup.sh",
+    "build": "./build.sh",
     "path": "dist/archive.tar.gz",
     "arch": [
       "linux/amd64",
       "linux/arm64",
-      "darwin/arm64",
-      "windows/amd64"
-    ]
+      "darwin/arm64"
+    ],
+    "darwin_deps": []
   }
 }
