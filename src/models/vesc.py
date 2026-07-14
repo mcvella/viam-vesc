@@ -165,21 +165,27 @@ class Vesc(Motor, EasyResource):
         async with self._lock:
             transport = self._require_transport()
 
-            # Update state
             self._target_power = power
             self._is_powered = power != 0.0
-            self._current_power = power
             self._is_moving = power != 0.0
 
-            transport.set_duty(self._target_power)
-
-            if power != 0.0:
-                # Start simple timer task to keep motor running
+            if self._ramp_up_enabled:
+                # Keep commanded power as the ramp start; do not jump to target.
+                transport.set_duty(self._current_power)
                 self._stop_power_task = False
                 self._power_task = asyncio.create_task(self._simple_power_task())
-                self.logger.info(f"Set power to {power:.2f}")
+                self.logger.info(
+                    f"Ramping power from {self._current_power:.2f} to {power:.2f}"
+                )
             else:
-                self.logger.info("Motor stopped")
+                self._current_power = power
+                transport.set_duty(power)
+                if power != 0.0:
+                    self._stop_power_task = False
+                    self._power_task = asyncio.create_task(self._simple_power_task())
+                    self.logger.info(f"Set power to {power:.2f}")
+                else:
+                    self.logger.info("Motor stopped")
 
     async def go_for(
         self,
