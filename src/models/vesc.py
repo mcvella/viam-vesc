@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import (Any, ClassVar, Dict, List, Mapping, Optional, Sequence,
                     Tuple)
@@ -13,6 +14,18 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
 from .transport import VescTransport, create_transport, validate_transport_attributes
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class Vesc(Motor, EasyResource):
@@ -37,6 +50,7 @@ class Vesc(Motor, EasyResource):
         self._ramp_up_enabled = True
         self._ramp_up_rate = 0.25  # Power change per second
         self._current_ramp_power = 0.0
+        self._ramp_last_ts = 0.0
         self._direction_change_in_progress = False
         self._duty_cycle_format = "int"
         self._transport_name = "serial"
@@ -100,12 +114,24 @@ class Vesc(Motor, EasyResource):
 
         attributes = struct_to_dict(config.attributes)
 
-        self._debug_mode = bool(attributes.get("debug", True))
+        self._debug_mode = _as_bool(attributes.get("debug"), True)
         self._command_interval = float(attributes.get("command_interval", 0.01))
-        self._ramp_up_enabled = bool(attributes.get("ramp_up_enabled", True))
+        if self._command_interval <= 0:
+            self._command_interval = 0.01
+        self._ramp_up_enabled = _as_bool(attributes.get("ramp_up_enabled"), True)
         self._ramp_up_rate = float(attributes.get("ramp_up_rate", 0.25))
+        if self._ramp_up_rate <= 0:
+            self._ramp_up_rate = 0.25
         self._duty_cycle_format = attributes.get("duty_cycle_format", "int")
         self._transport_name = str(attributes.get("transport", "serial")).lower()
+        self.logger.info(
+            "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
+            "command_interval=%s",
+            self._transport_name,
+            self._ramp_up_enabled,
+            self._ramp_up_rate,
+            self._command_interval,
+        )
 
         try:
             self._transport = create_transport(attributes, self.logger)
@@ -171,19 +197,32 @@ class Vesc(Motor, EasyResource):
 
             if self._ramp_up_enabled:
                 # Keep commanded power as the ramp start; do not jump to target.
+                # Wall-clock ramp in the background task (not rate*interval once).
+                self._ramp_last_ts = time.monotonic()
+                self._current_ramp_power = self._current_power
                 transport.set_duty(self._current_power)
                 self._stop_power_task = False
                 self._power_task = asyncio.create_task(self._simple_power_task())
+                est = (
+                    abs(power - self._current_power) / self._ramp_up_rate
+                    if self._ramp_up_rate > 0
+                    else 0.0
+                )
                 self.logger.info(
-                    f"Ramping power from {self._current_power:.2f} to {power:.2f}"
+                    "Ramping power from %.3f to %.3f (rate=%.3f/s, ~%.2fs)",
+                    self._current_power,
+                    power,
+                    self._ramp_up_rate,
+                    est,
                 )
             else:
                 self._current_power = power
+                self._current_ramp_power = power
                 transport.set_duty(power)
                 if power != 0.0:
                     self._stop_power_task = False
                     self._power_task = asyncio.create_task(self._simple_power_task())
-                    self.logger.info(f"Set power to {power:.2f}")
+                    self.logger.info(f"Set power to {power:.2f} (ramp disabled)")
                 else:
                     self.logger.info("Motor stopped")
 
@@ -424,7 +463,7 @@ class Vesc(Motor, EasyResource):
 
         elif command_name == "set_ramp_up":
             enabled = command.get("enabled", True)
-            self._ramp_up_enabled = bool(enabled)
+            self._ramp_up_enabled = _as_bool(enabled, True)
             return {"status": "success", "ramp_up_enabled": self._ramp_up_enabled}
 
         elif command_name == "set_ramp_rate":
@@ -438,13 +477,16 @@ class Vesc(Motor, EasyResource):
             }
 
         elif command_name == "get_ramp_status":
-            return {
-                "status": "success",
-                "ramp_up_enabled": self._ramp_up_enabled,
-                "ramp_up_rate": self._ramp_up_rate,
-                "current_ramp_power": self._current_ramp_power,
-                "target_power": self._target_power,
-            }
+            async with self._lock:
+                return {
+                    "status": "success",
+                    "ramp_up_enabled": self._ramp_up_enabled,
+                    "ramp_up_rate": self._ramp_up_rate,
+                    "current_power": self._current_power,
+                    "current_ramp_power": self._current_power,
+                    "target_power": self._target_power,
+                    "command_interval": self._command_interval,
+                }
 
         elif command_name == "force_stop":
             await self._halt_power_task()
@@ -508,15 +550,23 @@ class Vesc(Motor, EasyResource):
             transport.close()
 
     async def _simple_power_task(self):
+        last_logged = 0.0
         while True:
             try:
                 async with self._lock:
                     if self._stop_power_task:
                         return
                     if self._ramp_up_enabled:
-                        max_step = self._ramp_up_rate * self._command_interval
+                        now = time.monotonic()
+                        # Cap dt so a stalled event loop cannot leap to the target.
+                        dt = min(max(0.0, now - self._ramp_last_ts), 0.05)
+                        self._ramp_last_ts = now
+                        max_step = self._ramp_up_rate * dt
                         delta = self._target_power - self._current_power
-                        if abs(delta) > max_step:
+                        if max_step <= 0:
+                            # First loop often has dt≈0; wait for the next tick.
+                            pass
+                        elif abs(delta) > max_step:
                             self._current_power += (
                                 max_step if delta > 0 else -max_step
                             )
@@ -525,14 +575,28 @@ class Vesc(Motor, EasyResource):
                     else:
                         self._current_power = self._target_power
 
+                    self._current_ramp_power = self._current_power
+
                     # Snapshot under the lock so close/reconfigure cannot swap
                     # transport out from under a mid-flight set_duty call.
                     transport = self._transport
                     duty = self._current_power
+                    target = self._target_power
                     interval = self._command_interval
+                    ramp_enabled = self._ramp_up_enabled
 
                 if transport is not None:
                     transport.set_duty(duty)
+
+                # Occasional progress logs while a ramp is in flight.
+                if ramp_enabled and abs(duty - target) > 1e-4:
+                    now = time.monotonic()
+                    if now - last_logged >= 0.5:
+                        self.logger.info(
+                            "Ramp progress: commanded=%.3f target=%.3f", duty, target
+                        )
+                        last_logged = now
+
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
