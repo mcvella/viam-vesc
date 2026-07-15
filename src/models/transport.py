@@ -23,8 +23,15 @@ class VescStatus:
     current_in: float = 0.0
     pid_pos: float = 0.0
     tachometer: float = 0.0
+    # STATUS_5 as four big-endian uint16 words (A,B,C,D). B is the low half
+    # of the int32 tachometer and is what typically changes first.
+    status5_a: float = 0.0
+    status5_b: float = 0.0
+    status5_c: float = 0.0
+    status5_d: float = 0.0
     input_voltage: float = 0.0
     last_update: float = 0.0
+    status5_last_update: float = 0.0
     raw_hex: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -42,8 +49,13 @@ class VescStatus:
             "current_in": self.current_in,
             "pid_pos": self.pid_pos,
             "tachometer": self.tachometer,
+            "status5_a": self.status5_a,
+            "status5_b": self.status5_b,
+            "status5_c": self.status5_c,
+            "status5_d": self.status5_d,
             "input_voltage": self.input_voltage,
             "last_update": self.last_update,
+            "status5_last_update": self.status5_last_update,
         }
 
 
@@ -85,6 +97,10 @@ class VescTransport(ABC):
     @abstractmethod
     def get_status(self) -> Optional[VescStatus]:
         ...
+
+    def get_tachometer(self) -> Optional[float]:
+        """CAN STATUS_5 tachometer when available; otherwise None."""
+        return None
 
     def clear_buffers(self) -> bool:
         """Clear I/O buffers when supported (serial only by default)."""

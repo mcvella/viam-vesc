@@ -150,9 +150,21 @@ class CanTransport(VescTransport):
                 current_in=self._status.current_in,
                 pid_pos=self._status.pid_pos,
                 tachometer=self._status.tachometer,
+                status5_a=self._status.status5_a,
+                status5_b=self._status.status5_b,
+                status5_c=self._status.status5_c,
+                status5_d=self._status.status5_d,
                 input_voltage=self._status.input_voltage,
                 last_update=self._status.last_update,
+                status5_last_update=self._status.status5_last_update,
             )
+
+    def get_tachometer(self) -> Optional[float]:
+        """Return STATUS_5 tachometer (int32 over A||B), or None if not seen yet."""
+        with self._status_lock:
+            if self._status.status5_last_update <= 0:
+                return None
+            return self._status.tachometer
 
     def _build_extended_id(self, command: int) -> int:
         return ((command & 0xFF) << 8) | (self.vesc_id & 0xFF)
@@ -238,8 +250,17 @@ class CanTransport(VescTransport):
                 self._status.current_in = struct.unpack(">h", data[4:6])[0] / 10.0
                 self._status.pid_pos = struct.unpack(">h", data[6:8])[0] / 50.0
             elif command == CAN_PACKET_STATUS_5:
-                self._status.tachometer = float(struct.unpack(">i", data[0:4])[0])
+                # Payload: [tachometer int32 BE][vin*10 int16 BE][reserved]
+                # As four uint16 words: A,B,C,D — B is the low half of tachometer.
+                a, b, c, d = struct.unpack(">HHHH", data[0:8])
+                tach = float(struct.unpack(">i", data[0:4])[0])
+                self._status.status5_a = float(a)
+                self._status.status5_b = float(b)
+                self._status.status5_c = float(c)
+                self._status.status5_d = float(d)
+                self._status.tachometer = tach
                 self._status.input_voltage = struct.unpack(">h", data[4:6])[0] / 10.0
+                self._status.status5_last_update = time.time()
             else:
                 return
 

@@ -54,6 +54,11 @@ class Vesc(Motor, EasyResource):
         self._direction_change_in_progress = False
         self._duty_cycle_format = "int"
         self._transport_name = "serial"
+        # CAN odometry: revolutions = (tachometer - tach_zero) / ticks_per_rotation
+        self._ticks_per_rotation = 1.0
+        self._tach_zero = 0.0
+        self._tach_zero_initialized = False
+        self._position_offset = 0.0
 
     @classmethod
     def new(
@@ -124,13 +129,20 @@ class Vesc(Motor, EasyResource):
             self._ramp_up_rate = 0.25
         self._duty_cycle_format = attributes.get("duty_cycle_format", "int")
         self._transport_name = str(attributes.get("transport", "serial")).lower()
+        self._ticks_per_rotation = float(attributes.get("ticks_per_rotation", 1.0))
+        if self._ticks_per_rotation == 0:
+            raise ValueError("ticks_per_rotation must be non-zero")
+        self._tach_zero = 0.0
+        self._tach_zero_initialized = False
+        self._position_offset = 0.0
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
-            "command_interval=%s",
+            "command_interval=%s ticks_per_rotation=%s",
             self._transport_name,
             self._ramp_up_enabled,
             self._ramp_up_rate,
             self._command_interval,
+            self._ticks_per_rotation,
         )
 
         try:
@@ -321,6 +333,20 @@ class Vesc(Motor, EasyResource):
     ):
         """Reset the zero position with an offset"""
         async with self._lock:
+            if self._transport_name == "can" and self._transport is not None:
+                tach = self._transport.get_tachometer()
+                if tach is None:
+                    raise RuntimeError(
+                        "Cannot reset zero: no CAN STATUS_5 tachometer received yet"
+                    )
+                self._tach_zero = tach
+                self._tach_zero_initialized = True
+                self._position_offset = offset
+                self._position = offset
+                self.logger.info(
+                    "Reset CAN zero: tach=%.0f offset=%.3f rev", tach, offset
+                )
+                return
             self._position = offset
             self.logger.info(f"Reset zero position with offset {offset}")
 
@@ -331,7 +357,28 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ) -> float:
-        """Get the current position in revolutions"""
+        """Get the current position in revolutions.
+
+        On CAN, position is derived from STATUS_5 tachometer (int32 over words
+        A||B; B is the changing low half): 
+        (tachometer - tach_zero) / ticks_per_rotation + offset.
+        Serial keeps the software position counter.
+        """
+        if self._transport_name == "can" and self._transport is not None:
+            tach = self._transport.get_tachometer()
+            if tach is None:
+                return self._position
+            async with self._lock:
+                if not self._tach_zero_initialized:
+                    # First reading defines the zero unless ResetZeroPosition ran.
+                    self._tach_zero = tach
+                    self._tach_zero_initialized = True
+                pos = (
+                    (tach - self._tach_zero) / self._ticks_per_rotation
+                    + self._position_offset
+                )
+                self._position = pos
+                return pos
         return self._position
 
     async def get_properties(

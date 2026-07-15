@@ -18,7 +18,8 @@
       "attributes": {
         "transport": "can",
         "interface": "can0",
-        "id": 1
+        "id": 1,
+        "ticks_per_rotation": 100
       }
     },
     {
@@ -28,7 +29,8 @@
       "attributes": {
         "transport": "can",
         "interface": "can0",
-        "id": 2
+        "id": 2,
+        "ticks_per_rotation": 100
       }
     }
   ],
