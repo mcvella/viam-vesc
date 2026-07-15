@@ -22,13 +22,13 @@ class VescStatus:
     motor_temp: float = 0.0
     current_in: float = 0.0
     pid_pos: float = 0.0
+    # STATUS_5 bytes 0-3: signed int32 tachometer (VESC EREV counts).
     tachometer: float = 0.0
-    # STATUS_5 as four big-endian uint16 words (A,B,C,D). B is the low half
-    # of the int32 tachometer and is what typically changes first.
-    status5_a: float = 0.0
-    status5_b: float = 0.0
-    status5_c: float = 0.0
-    status5_d: float = 0.0
+    # Optional raw uint16 view of STATUS_5 payload (debug / sniffing only).
+    status5_u16_0: float = 0.0
+    status5_u16_1: float = 0.0
+    status5_u16_2: float = 0.0
+    status5_u16_3: float = 0.0
     input_voltage: float = 0.0
     last_update: float = 0.0
     status5_last_update: float = 0.0
@@ -49,10 +49,12 @@ class VescStatus:
             "current_in": self.current_in,
             "pid_pos": self.pid_pos,
             "tachometer": self.tachometer,
-            "status5_a": self.status5_a,
-            "status5_b": self.status5_b,
-            "status5_c": self.status5_c,
-            "status5_d": self.status5_d,
+            "status5_u16": [
+                self.status5_u16_0,
+                self.status5_u16_1,
+                self.status5_u16_2,
+                self.status5_u16_3,
+            ],
             "input_voltage": self.input_voltage,
             "last_update": self.last_update,
             "status5_last_update": self.status5_last_update,

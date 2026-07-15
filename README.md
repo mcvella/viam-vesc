@@ -56,7 +56,7 @@ Use `transport` to select the I/O backend (`serial` default, or `can`).
 
 CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VESC CAN protocol](https://github.com/vedderb/bldc/blob/master/documentation/comm_can.md) and the [erh/vesccan](https://github.com/erh/vesccan) reference module.
 
-**Position (CAN):** `GetPosition` uses STATUS_5 (`0x1B00 \| id`) tachometer — a big-endian int32 spanning words A and B in an `HHHH` unpack of the payload (B is the low half that usually changes first). Revolutions = `(tachometer − zero) / ticks_per_rotation`. Call `ResetZeroPosition` to set the zero. Serial still uses a software counter.
+**Position (CAN):** `GetPosition` uses the STATUS_5 (`0x1B00 \| id`) **tachometer** (signed int32 in bytes 0–3). Revolutions = `(tachometer − zero) / ticks_per_rotation`. `attributes.id` must match the VESC id in that frame. Call `ResetZeroPosition` after startup before measuring travel. DoCommand `{"command":"get_position_debug"}` shows whether STATUS_5 was seen. Serial still uses a software counter.
 
 **SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
 

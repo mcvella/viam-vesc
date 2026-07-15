@@ -59,6 +59,7 @@ class Vesc(Motor, EasyResource):
         self._tach_zero = 0.0
         self._tach_zero_initialized = False
         self._position_offset = 0.0
+        self._warned_missing_status5 = False
 
     @classmethod
     def new(
@@ -135,6 +136,7 @@ class Vesc(Motor, EasyResource):
         self._tach_zero = 0.0
         self._tach_zero_initialized = False
         self._position_offset = 0.0
+        self._warned_missing_status5 = False
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
             "command_interval=%s ticks_per_rotation=%s",
@@ -359,20 +361,33 @@ class Vesc(Motor, EasyResource):
     ) -> float:
         """Get the current position in revolutions.
 
-        On CAN, position is derived from STATUS_5 tachometer (int32 over words
-        A||B; B is the changing low half): 
-        (tachometer - tach_zero) / ticks_per_rotation + offset.
+        On CAN, position uses STATUS_5 tachometer (int32):
+        (tachometer - zero) / ticks_per_rotation + offset.
         Serial keeps the software position counter.
         """
         if self._transport_name == "can" and self._transport is not None:
             tach = self._transport.get_tachometer()
             if tach is None:
+                if not self._warned_missing_status5:
+                    self._warned_missing_status5 = True
+                    self.logger.warning(
+                        "GetPosition is 0: module has not received STATUS_5 yet "
+                        "for this VESC id. Confirm attributes.id matches the id "
+                        "in your can dump (0x1B00|id). DoCommand "
+                        '{"command":"get_position_debug"}.'
+                    )
                 return self._position
             async with self._lock:
                 if not self._tach_zero_initialized:
                     # First reading defines the zero unless ResetZeroPosition ran.
                     self._tach_zero = tach
                     self._tach_zero_initialized = True
+                    self.logger.info(
+                        "CAN position zero locked at tachometer=%.0f "
+                        "(ticks_per_rotation=%s)",
+                        tach,
+                        self._ticks_per_rotation,
+                    )
                 pos = (
                     (tach - self._tach_zero) / self._ticks_per_rotation
                     + self._position_offset
@@ -491,12 +506,37 @@ class Vesc(Motor, EasyResource):
                 "position": self._position,
                 "debug_mode": self._debug_mode,
                 "transport": self._transport_name,
+                "ticks_per_rotation": self._ticks_per_rotation,
             }
             if transport:
                 vesc_status = transport.get_status()
                 if vesc_status is not None and vesc_status.raw_hex is None:
                     result["vesc"] = vesc_status.as_dict()
+                get_dbg = getattr(transport, "get_status5_debug", None)
+                if callable(get_dbg):
+                    result["status5"] = get_dbg()
             return result
+
+        elif command_name == "get_position_debug":
+            dbg: Dict[str, Any] = {
+                "status": "success",
+                "transport": self._transport_name,
+                "ticks_per_rotation": self._ticks_per_rotation,
+                "tach_zero": self._tach_zero,
+                "tach_zero_initialized": self._tach_zero_initialized,
+                "position_offset": self._position_offset,
+                "position": self._position,
+            }
+            if transport and hasattr(transport, "get_status5_debug"):
+                dbg["status5"] = transport.get_status5_debug()
+                tach = transport.get_tachometer()
+                dbg["tachometer"] = tach
+                if tach is not None and self._tach_zero_initialized:
+                    dbg["position_calc"] = (
+                        (tach - self._tach_zero) / self._ticks_per_rotation
+                        + self._position_offset
+                    )
+            return dbg
 
         elif command_name == "set_command_interval":
             interval = command.get("interval", 0.01)

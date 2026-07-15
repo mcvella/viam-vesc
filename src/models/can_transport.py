@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import can
 
@@ -41,6 +41,7 @@ class CanTransport(VescTransport):
         self._status_lock = threading.Lock()
         self._stop_listen = threading.Event()
         self._listen_thread: Optional[threading.Thread] = None
+        self._logged_first_status5 = False
 
     def open(self) -> None:
         try:
@@ -54,19 +55,9 @@ class CanTransport(VescTransport):
                 "are on Linux."
             ) from e
 
-        # Filter for extended frames from this VESC ID (any command in bits 15-8).
-        # Mask 0xFF matches the low 8 bits (controller id).
-        self.bus = can.Bus(
-            channel=self.interface,
-            interface="socketcan",
-            can_filters=[
-                {
-                    "can_id": self.vesc_id,
-                    "can_mask": 0xFF,
-                    "extended": True,
-                }
-            ],
-        )
+        # No kernel filter: some SocketCAN filter setups drop STATUS_5. We filter
+        # by VESC id in software in _handle_status_message.
+        self.bus = can.Bus(channel=self.interface, interface="socketcan")
         self._stop_listen.clear()
         self._listen_thread = threading.Thread(
             target=self._listen_for_messages,
@@ -76,7 +67,8 @@ class CanTransport(VescTransport):
         self._listen_thread.start()
         if self.logger:
             self.logger.info(
-                f"Connected to VESC on CAN {self.interface} id={self.vesc_id}"
+                f"Connected to VESC on CAN {self.interface} id={self.vesc_id} "
+                f"(expect STATUS_5 id=0x{(CAN_PACKET_STATUS_5 << 8) | self.vesc_id:X})"
             )
 
     def close(self) -> None:
@@ -150,21 +142,42 @@ class CanTransport(VescTransport):
                 current_in=self._status.current_in,
                 pid_pos=self._status.pid_pos,
                 tachometer=self._status.tachometer,
-                status5_a=self._status.status5_a,
-                status5_b=self._status.status5_b,
-                status5_c=self._status.status5_c,
-                status5_d=self._status.status5_d,
+                status5_u16_0=self._status.status5_u16_0,
+                status5_u16_1=self._status.status5_u16_1,
+                status5_u16_2=self._status.status5_u16_2,
+                status5_u16_3=self._status.status5_u16_3,
                 input_voltage=self._status.input_voltage,
                 last_update=self._status.last_update,
                 status5_last_update=self._status.status5_last_update,
             )
 
     def get_tachometer(self) -> Optional[float]:
-        """Return STATUS_5 tachometer (int32 over A||B), or None if not seen yet."""
+        """Return STATUS_5 tachometer (int32), or None if not seen yet."""
         with self._status_lock:
             if self._status.status5_last_update <= 0:
                 return None
             return self._status.tachometer
+
+    def get_status5_debug(self) -> Dict[str, Any]:
+        with self._status_lock:
+            return {
+                "status5_seen": self._status.status5_last_update > 0,
+                "status5_age_s": (
+                    (time.time() - self._status.status5_last_update)
+                    if self._status.status5_last_update > 0
+                    else None
+                ),
+                "tachometer": self._status.tachometer,
+                "status5_u16": [
+                    self._status.status5_u16_0,
+                    self._status.status5_u16_1,
+                    self._status.status5_u16_2,
+                    self._status.status5_u16_3,
+                ],
+                "input_voltage": self._status.input_voltage,
+                "vesc_id": self.vesc_id,
+                "expect_arbitration_id": (CAN_PACKET_STATUS_5 << 8) | self.vesc_id,
+            }
 
     def _build_extended_id(self, command: int) -> int:
         return ((command & 0xFF) << 8) | (self.vesc_id & 0xFF)
@@ -208,13 +221,26 @@ class CanTransport(VescTransport):
                 continue
             if msg is None:
                 continue
-            if not msg.is_extended_id:
-                continue
+            # Do not require is_extended_id — match by arbitration id bits instead.
             self._handle_status_message(msg)
 
+    def _parse_status5(self, data: bytes) -> None:
+        """Parse STATUS_5: tachometer int32 + input voltage."""
+        # Pad short frames (some stacks omit reserved trailing bytes).
+        padded = data.ljust(8, b"\x00")
+        u0, u1, u2, u3 = struct.unpack(">HHHH", padded[0:8])
+        self._status.status5_u16_0 = float(u0)
+        self._status.status5_u16_1 = float(u1)
+        self._status.status5_u16_2 = float(u2)
+        self._status.status5_u16_3 = float(u3)
+        self._status.tachometer = float(struct.unpack(">i", padded[0:4])[0])
+        self._status.input_voltage = struct.unpack(">h", padded[4:6])[0] / 10.0
+        self._status.status5_last_update = time.time()
+
     def _handle_status_message(self, msg: can.Message) -> None:
-        command = (msg.arbitration_id >> 8) & 0xFF
-        sender_id = msg.arbitration_id & 0xFF
+        arb = int(msg.arbitration_id)
+        command = (arb >> 8) & 0xFF
+        sender_id = arb & 0xFF
         if sender_id != self.vesc_id:
             return
 
@@ -226,7 +252,11 @@ class CanTransport(VescTransport):
                 self._status.last_update = time.time()
             return
 
-        if len(data) < 8:
+        # STATUS_5 only needs 6+ bytes (tach + vin); others need 8.
+        if command == CAN_PACKET_STATUS_5:
+            if len(data) < 6:
+                return
+        elif len(data) < 8:
             return
 
         with self._status_lock:
@@ -250,17 +280,16 @@ class CanTransport(VescTransport):
                 self._status.current_in = struct.unpack(">h", data[4:6])[0] / 10.0
                 self._status.pid_pos = struct.unpack(">h", data[6:8])[0] / 50.0
             elif command == CAN_PACKET_STATUS_5:
-                # Payload: [tachometer int32 BE][vin*10 int16 BE][reserved]
-                # As four uint16 words: A,B,C,D — B is the low half of tachometer.
-                a, b, c, d = struct.unpack(">HHHH", data[0:8])
-                tach = float(struct.unpack(">i", data[0:4])[0])
-                self._status.status5_a = float(a)
-                self._status.status5_b = float(b)
-                self._status.status5_c = float(c)
-                self._status.status5_d = float(d)
-                self._status.tachometer = tach
-                self._status.input_voltage = struct.unpack(">h", data[4:6])[0] / 10.0
-                self._status.status5_last_update = time.time()
+                self._parse_status5(data)
+                if not self._logged_first_status5 and self.logger:
+                    self._logged_first_status5 = True
+                    self.logger.info(
+                        "First STATUS_5 arb=0x%X id=%s: tachometer=%.0f vin=%.1f",
+                        arb,
+                        self.vesc_id,
+                        self._status.tachometer,
+                        self._status.input_voltage,
+                    )
             else:
                 return
 
