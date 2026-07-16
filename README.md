@@ -54,9 +54,10 @@ Use `transport` to select the I/O backend (`serial` default, or `can`).
 | `id`        | int    | Required  | —       | VESC controller ID on the bus (0–255)            |
 | `ticks_per_rotation` | float | Optional | `1.0` | STATUS_5 tachometer counts per revolution for `GetPosition` / closed-loop RPM |
 | `closed_loop_rpm` | bool | Optional | `true` on CAN | When true (and tach seen), `SetRPM`/`GoFor`/`GoTo` use **mechanical** RPM via tach → duty PI |
-| `rpm_kp` | float | Optional | `0.003` | Proportional gain (duty per RPM error) for closed-loop speed |
-| `rpm_ki` | float | Optional | `0.015` | Integral gain (duty per RPM·s) for closed-loop speed |
-| `rpm_max_duty` | float | Optional | `1.0` | Max |duty| the RPM loop may command |
+| `rpm_kp` | float | Optional | `0.001` | Proportional gain (duty per RPM error) for closed-loop speed |
+| `rpm_ki` | float | Optional | `0.002` | Integral gain (duty per RPM·s) for closed-loop speed |
+| `rpm_max_duty` | float | Optional | `1.0` | Hard cap on |duty| from the RPM loop |
+| `rpm_duty_ref` | float | Optional | `500` | Soft authority: max |duty| ≈ `|rpm|/rpm_duty_ref + 0.05` (so `SetRPM(1)` stays ~5%) |
 
 CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VESC CAN protocol](https://github.com/vedderb/bldc/blob/master/documentation/comm_can.md) and the [erh/vesccan](https://github.com/erh/vesccan) reference module.
 

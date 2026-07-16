@@ -65,14 +65,18 @@ class Vesc(Motor, EasyResource):
         self._warned_missing_status5 = False
         # Closed-loop mechanical RPM (tach feedback → duty). No pole_pairs needed.
         self._closed_loop_rpm = True
-        self._rpm_kp = 0.003
-        self._rpm_ki = 0.015
+        self._rpm_kp = 0.001
+        self._rpm_ki = 0.002
         self._rpm_max_duty = 1.0
+        # Rough prior: duty ≈ |mech_rpm| / rpm_duty_ref (plus a small floor).
+        # Prevents SetRPM(1) from saturating to 100% duty while the loop learns.
+        self._rpm_duty_ref = 500.0
         self._rpm_integral = 0.0
         self._rpm_cmd_duty = 0.0
         self._measured_rpm = 0.0
         self._rpm_tach_last: Optional[float] = None
         self._rpm_tach_last_ts: Optional[float] = None
+        self._rpm_meas_last_ts: Optional[float] = None
 
     @classmethod
     def new(
@@ -159,20 +163,24 @@ class Vesc(Motor, EasyResource):
             attributes.get("closed_loop_rpm"),
             self._transport_name == "can",
         )
-        self._rpm_kp = float(attributes.get("rpm_kp", 0.003))
-        self._rpm_ki = float(attributes.get("rpm_ki", 0.015))
+        self._rpm_kp = float(attributes.get("rpm_kp", 0.001))
+        self._rpm_ki = float(attributes.get("rpm_ki", 0.002))
         self._rpm_max_duty = float(attributes.get("rpm_max_duty", 1.0))
         if self._rpm_max_duty <= 0 or self._rpm_max_duty > 1.0:
             self._rpm_max_duty = 1.0
+        self._rpm_duty_ref = float(attributes.get("rpm_duty_ref", 500.0))
+        if self._rpm_duty_ref < 10.0:
+            self._rpm_duty_ref = 10.0
         self._rpm_integral = 0.0
         self._rpm_cmd_duty = 0.0
         self._measured_rpm = 0.0
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
+        self._rpm_meas_last_ts = None
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
             "command_interval=%s ticks_per_rotation=%s closed_loop_rpm=%s "
-            "rpm_kp=%s rpm_ki=%s rpm_max_duty=%s",
+            "rpm_kp=%s rpm_ki=%s rpm_max_duty=%s rpm_duty_ref=%s",
             self._transport_name,
             self._ramp_up_enabled,
             self._ramp_up_rate,
@@ -182,6 +190,7 @@ class Vesc(Motor, EasyResource):
             self._rpm_kp,
             self._rpm_ki,
             self._rpm_max_duty,
+            self._rpm_duty_ref,
         )
 
         try:
@@ -258,6 +267,7 @@ class Vesc(Motor, EasyResource):
         self._measured_rpm = 0.0
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
+        self._rpm_meas_last_ts = None
         if rpm == 0.0:
             return
         self._stop_rpm_task = False
@@ -864,6 +874,10 @@ class Vesc(Motor, EasyResource):
 
         Closed-loop (CAN + tach): target is shaft RPM; PI adjusts duty so
         measured tach speed matches. Open-loop: re-send SET_RPM (ERPM).
+
+        Speed is only recomputed when the tachometer value changes. Unchanged
+        samples hold the last measurement (treating them as 0 RPM was winding
+        duty to 100% between STATUS_5 frames).
         """
         last_logged = 0.0
         while True:
@@ -878,6 +892,7 @@ class Vesc(Motor, EasyResource):
                     kp = self._rpm_kp
                     ki = self._rpm_ki
                     max_duty = self._rpm_max_duty
+                    duty_ref = self._rpm_duty_ref
                     closed = (
                         self._closed_loop_rpm
                         and self._transport_name == "can"
@@ -886,6 +901,8 @@ class Vesc(Motor, EasyResource):
                     integral = self._rpm_integral
                     tach_last = self._rpm_tach_last
                     tach_last_ts = self._rpm_tach_last_ts
+                    meas_last_ts = self._rpm_meas_last_ts
+                    measured = self._measured_rpm
 
                 if transport is None:
                     await asyncio.sleep(interval)
@@ -898,31 +915,47 @@ class Vesc(Motor, EasyResource):
 
                 tach = transport.get_tachometer()
                 now = time.monotonic()
-                measured = 0.0
-                dt = interval
-                if (
-                    tach is not None
-                    and tach_last is not None
-                    and tach_last_ts is not None
-                ):
-                    dt = max(now - tach_last_ts, 1e-3)
-                    # Cap dt so a pause cannot create a huge spike.
-                    dt = min(dt, 0.1)
-                    drevs = (tach - tach_last) / ticks
-                    measured = (drevs / dt) * 60.0
 
-                if tach is not None:
+                if tach is not None and tach_last is None:
+                    # Seed tach; wait for a second sample before trusting speed.
                     tach_last = tach
                     tach_last_ts = now
+                    measured = 0.0
+                elif (
+                    tach is not None
+                    and tach_last is not None
+                    and tach != tach_last
+                    and tach_last_ts is not None
+                ):
+                    real_dt = max(now - tach_last_ts, 1e-3)
+                    real_dt = min(real_dt, 0.5)
+                    drevs = (tach - tach_last) / ticks
+                    instant = (drevs / real_dt) * 60.0
+                    # Light EMA to tame single-tick quantization noise.
+                    measured = 0.4 * instant + 0.6 * measured
+                    tach_last = tach
+                    tach_last_ts = now
+                    meas_last_ts = now
+                elif meas_last_ts is not None and (now - meas_last_ts) > 0.35:
+                    # No tach motion for a while → treat as stopped.
+                    measured = 0.0
 
                 error = target - measured
-                integral += error * dt
+                integral += error * interval
+                # Bound integral so a stall cannot store a huge rewind.
+                # Cap roughly to what would produce ±max_duty via Ki alone.
+                if ki > 1e-9:
+                    i_lim = (max_duty / ki) * 1.5
+                    integral = max(-i_lim, min(i_lim, integral))
+
+                # Target-scaled duty ceiling: SetRPM(1) must not be allowed 100%.
+                # |target|/duty_ref + 5% floor, then clamp to rpm_max_duty.
+                auth = min(max_duty, max(0.05, abs(target) / duty_ref + 0.05))
 
                 raw = kp * error + ki * integral
-                duty = max(-max_duty, min(max_duty, raw))
-                # Anti-windup: undo integration when saturated in error direction.
-                if abs(raw) > max_duty and error * raw > 0:
-                    integral -= error * dt
+                duty = max(-auth, min(auth, raw))
+                if abs(raw) > auth and error * raw > 0:
+                    integral -= error * interval
 
                 transport.set_duty(duty)
 
@@ -934,14 +967,16 @@ class Vesc(Motor, EasyResource):
                     self._current_power = duty
                     self._rpm_tach_last = tach_last
                     self._rpm_tach_last_ts = tach_last_ts
-                    self._is_moving = abs(measured) > 1.0 or abs(target) > 0.0
+                    self._rpm_meas_last_ts = meas_last_ts
+                    self._is_moving = abs(measured) > 0.5 or abs(duty) > 0.02
 
                 if now - last_logged >= 0.5:
                     self.logger.info(
-                        "RPM loop: target=%.1f meas=%.1f duty=%.3f err=%.1f",
+                        "RPM loop: target=%.1f meas=%.1f duty=%.3f auth=%.3f err=%.1f",
                         target,
                         measured,
                         duty,
+                        auth,
                         error,
                     )
                     last_logged = now
