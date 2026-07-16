@@ -46,6 +46,9 @@ class Vesc(Motor, EasyResource):
         self._power_task = None
         self._target_power = 0.0
         self._stop_power_task = False
+        self._rpm_task = None
+        self._target_rpm = 0.0
+        self._stop_rpm_task = False
         self._command_interval = 0.01  # 10ms default, configurable
         self._ramp_up_enabled = True
         self._ramp_up_rate = 0.25  # Power change per second
@@ -107,11 +110,15 @@ class Vesc(Motor, EasyResource):
             config (ComponentConfig): The new configuration
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both required and optional)
         """
-        # Sync path: cancel the keepalive task, then swap transports.
+        # Sync path: cancel keepalive tasks, then swap transports.
         self._stop_power_task = True
+        self._stop_rpm_task = True
         if self._power_task and not self._power_task.done():
             self._power_task.cancel()
         self._power_task = None
+        if self._rpm_task and not self._rpm_task.done():
+            self._rpm_task.cancel()
+        self._rpm_task = None
 
         old_transport = self._transport
         self._transport = None
@@ -170,11 +177,27 @@ class Vesc(Motor, EasyResource):
         return self._transport
 
     async def _halt_power_task(self) -> None:
-        """Stop the keepalive/ramp task without holding `_lock` during the await."""
+        """Stop the duty keepalive/ramp task without holding `_lock` during await."""
         async with self._lock:
             self._stop_power_task = True
             task = self._power_task
             self._power_task = None
+        await self._await_halted_task(task)
+
+    async def _halt_rpm_task(self) -> None:
+        """Stop the RPM keepalive task without holding `_lock` during await."""
+        async with self._lock:
+            self._stop_rpm_task = True
+            task = self._rpm_task
+            self._rpm_task = None
+        await self._await_halted_task(task)
+
+    async def _halt_control_tasks(self) -> None:
+        """Stop duty and RPM keepalives (VESC CAN times out ~0.5s without repeats)."""
+        await self._halt_power_task()
+        await self._halt_rpm_task()
+
+    async def _await_halted_task(self, task) -> None:
         if task and not task.done():
             try:
                 await asyncio.wait_for(task, timeout=0.5)
@@ -185,6 +208,17 @@ class Vesc(Motor, EasyResource):
                         await task
                     except asyncio.CancelledError:
                         pass
+
+    def _start_rpm_keepalive(self, rpm: float) -> None:
+        """Caller must hold `_lock`. Starts repeating SET_RPM to defeat CAN timeout."""
+        self._target_rpm = rpm
+        self._current_rpm = rpm
+        self._is_powered = rpm != 0.0
+        self._is_moving = rpm != 0.0
+        if rpm == 0.0:
+            return
+        self._stop_rpm_task = False
+        self._rpm_task = asyncio.create_task(self._rpm_keepalive_task())
 
     @dataclass
     class Properties(Motor.Properties):
@@ -200,7 +234,7 @@ class Vesc(Motor, EasyResource):
     ):
         """Set motor power as a percentage (-1.0 to 1.0)"""
         power = max(-1.0, min(1.0, power))  # Clamp to [-1, 1]
-        await self._halt_power_task()
+        await self._halt_control_tasks()
 
         async with self._lock:
             transport = self._require_transport()
@@ -263,14 +297,12 @@ class Vesc(Motor, EasyResource):
         start = await self.get_position()
         target = start + revolutions
 
-        await self._halt_power_task()
+        await self._halt_control_tasks()
         async with self._lock:
             transport = self._require_transport()
             if not transport.set_rpm(signed_rpm):
                 raise RuntimeError("Failed to set RPM for GoFor")
-            self._current_rpm = signed_rpm
-            self._is_powered = True
-            self._is_moving = True
+            self._start_rpm_keepalive(signed_rpm)
 
         self.logger.info(
             "GoFor: start=%.3f target=%.3f rev=%.3f rpm=%.1f",
@@ -287,46 +319,110 @@ class Vesc(Motor, EasyResource):
             and self._transport.get_tachometer() is not None
         )
 
-        if use_odometry:
-            await self._wait_for_position(target, revolutions > 0, abs(revolutions), abs(rpm))
-        else:
-            time_needed = abs(revolutions / rpm) * 60.0
-            self.logger.warning(
-                "GoFor using timed motion (%.2fs); no tachometer odometry",
-                time_needed,
-            )
-            await asyncio.sleep(time_needed)
-            async with self._lock:
-                self._position = target
-
-        await self.stop()
+        try:
+            if use_odometry:
+                await self._wait_for_position(
+                    start=start,
+                    target=target,
+                    moving_positive=revolutions > 0,
+                    distance_revs=abs(revolutions),
+                    rpm_abs=abs(rpm),
+                    timeout=timeout,
+                )
+            else:
+                time_needed = abs(revolutions / rpm) * 60.0
+                if timeout is not None and timeout > 0:
+                    time_needed = min(time_needed, timeout)
+                self.logger.warning(
+                    "GoFor using timed motion (%.2fs); no tachometer odometry",
+                    time_needed,
+                )
+                await asyncio.sleep(time_needed)
+                async with self._lock:
+                    self._position = target
+        finally:
+            # Always drop keepalive / duty so a failed GoFor cannot leave the motor spinning.
+            await self.stop()
 
     async def _wait_for_position(
         self,
+        *,
+        start: float,
         target: float,
         moving_positive: bool,
         distance_revs: float,
         rpm_abs: float,
+        timeout: Optional[float] = None,
     ) -> None:
-        """Poll GetPosition until target is reached or timeout."""
+        """Poll GetPosition until target is reached or timeout.
+
+        Raises TimeoutError if the target is not reached in time.
+        """
         # Allow 2x nominal time plus 2s margin; poll at ~50Hz.
         nominal_s = (distance_revs / max(rpm_abs, 1e-6)) * 60.0
-        deadline = time.monotonic() + max(nominal_s * 2.0, 2.0) + 2.0
-        tolerance = max(0.02, 1.0 / max(abs(self._ticks_per_rotation), 1.0))
+        wait_s = max(nominal_s * 2.0, 2.0) + 2.0
+        if timeout is not None and timeout > 0:
+            wait_s = min(wait_s, timeout)
+        deadline = time.monotonic() + wait_s
 
+        # One tach tick in revolutions. Cap tolerance below half the move so the
+        # start position cannot satisfy "reached" (e.g. 0.01 rev with tol 0.02).
+        tick_rev = 1.0 / max(abs(self._ticks_per_rotation), 1e-9)
+        tolerance = max(tick_rev, min(0.02, distance_revs * 0.25))
+        if distance_revs > 0:
+            tolerance = min(tolerance, max(distance_revs * 0.5, tick_rev * 0.5))
+
+        last_logged = 0.0
         while time.monotonic() < deadline:
             pos = await self.get_position()
             if moving_positive and pos >= target - tolerance:
-                self.logger.info("GoFor/GoTo reached target pos=%.3f", pos)
+                self.logger.info(
+                    "GoFor/GoTo reached target pos=%.3f (target=%.3f tol=%.4f)",
+                    pos,
+                    target,
+                    tolerance,
+                )
                 return
             if not moving_positive and pos <= target + tolerance:
-                self.logger.info("GoFor/GoTo reached target pos=%.3f", pos)
+                self.logger.info(
+                    "GoFor/GoTo reached target pos=%.3f (target=%.3f tol=%.4f)",
+                    pos,
+                    target,
+                    tolerance,
+                )
                 return
+
+            # Detect inverted tach vs SET_RPM sign early.
+            if moving_positive and pos < start - max(tolerance, 0.05):
+                self.logger.warning(
+                    "GoFor/GoTo position moving opposite to commanded +RPM "
+                    "(start=%.3f pos=%.3f). Check motor direction / ticks sign.",
+                    start,
+                    pos,
+                )
+            elif not moving_positive and pos > start + max(tolerance, 0.05):
+                self.logger.warning(
+                    "GoFor/GoTo position moving opposite to commanded -RPM "
+                    "(start=%.3f pos=%.3f). Check motor direction / ticks sign.",
+                    start,
+                    pos,
+                )
+
+            now = time.monotonic()
+            if now - last_logged >= 0.5:
+                self.logger.info(
+                    "GoFor/GoTo progress pos=%.3f target=%.3f remaining=%.3f",
+                    pos,
+                    target,
+                    (target - pos) if moving_positive else (pos - target),
+                )
+                last_logged = now
             await asyncio.sleep(0.02)
 
         pos = await self.get_position()
-        self.logger.warning(
-            "GoFor/GoTo timed out at pos=%.3f (target=%.3f)", pos, target
+        raise TimeoutError(
+            f"GoFor/GoTo timed out at pos={pos:.3f} (target={target:.3f}, "
+            f"start={start:.3f}, waited={wait_s:.1f}s)"
         )
 
     async def go_to(
@@ -360,18 +456,15 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ):
-        """Set the motor RPM (halts duty keepalive so it cannot fight RPM mode)."""
-        await self._halt_power_task()
+        """Set the motor RPM (with CAN keepalive so the VESC does not time out)."""
+        await self._halt_control_tasks()
         async with self._lock:
             try:
                 transport = self._require_transport()
-                if transport.set_rpm(rpm):
-                    self._current_rpm = rpm
-                    self._is_powered = rpm != 0.0
-                    self._is_moving = rpm != 0.0
-                    self.logger.info(f"Set RPM to {rpm}")
-                else:
+                if not transport.set_rpm(rpm):
                     raise RuntimeError("Failed to set RPM")
+                self._start_rpm_keepalive(rpm)
+                self.logger.info(f"Set RPM to {rpm}")
             except Exception as e:
                 self.logger.error(f"Failed to set RPM: {e}")
                 raise RuntimeError(f"Failed to set RPM: {e}")
@@ -465,12 +558,13 @@ class Vesc(Motor, EasyResource):
         **kwargs
     ):
         """Stop the motor"""
-        await self._halt_power_task()
+        await self._halt_control_tasks()
 
         async with self._lock:
             self._require_transport().set_duty(0.0)
 
             self._target_power = 0.0
+            self._target_rpm = 0.0
             self._is_powered = False
             self._current_power = 0.0
             self._current_rpm = 0.0
@@ -627,7 +721,7 @@ class Vesc(Motor, EasyResource):
                 }
 
         elif command_name == "force_stop":
-            await self._halt_power_task()
+            await self._halt_control_tasks()
             # Send stop under the lock with no awaits so reconfigure()/close()
             # cannot close the transport between state reset and device commands.
             async with self._lock:
@@ -650,6 +744,7 @@ class Vesc(Motor, EasyResource):
                         ),
                     }
                 self._target_power = 0.0
+                self._target_rpm = 0.0
                 self._is_powered = False
                 self._current_power = 0.0
                 self._current_rpm = 0.0
@@ -680,12 +775,31 @@ class Vesc(Motor, EasyResource):
         return []
 
     async def close(self):
-        await self._halt_power_task()
+        await self._halt_control_tasks()
         async with self._lock:
             transport = self._transport
             self._transport = None
         if transport:
             transport.close()
+
+    async def _rpm_keepalive_task(self):
+        """Re-send SET_RPM so the VESC CAN/UART timeout (~0.5s) does not stop the motor."""
+        while True:
+            try:
+                async with self._lock:
+                    if self._stop_rpm_task:
+                        return
+                    transport = self._transport
+                    rpm = self._target_rpm
+                    interval = self._command_interval
+                if transport is not None:
+                    transport.set_rpm(rpm)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error(f"RPM keepalive error: {e}")
+                await asyncio.sleep(self._command_interval)
 
     async def _simple_power_task(self):
         last_logged = 0.0
