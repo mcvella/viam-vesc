@@ -52,11 +52,17 @@ Use `transport` to select the I/O backend (`serial` default, or `can`).
 | `transport` | string | Required  | —       | Must be `"can"`                                  |
 | `interface` | string | Required  | —       | Linux CAN device (e.g. `can0`)                   |
 | `id`        | int    | Required  | —       | VESC controller ID on the bus (0–255)            |
-| `ticks_per_rotation` | float | Optional | `1.0` | STATUS_5 tachometer counts per revolution for `GetPosition` |
+| `ticks_per_rotation` | float | Optional | `1.0` | STATUS_5 tachometer counts per revolution for `GetPosition` / closed-loop RPM |
+| `closed_loop_rpm` | bool | Optional | `true` on CAN | When true (and tach seen), `SetRPM`/`GoFor`/`GoTo` use **mechanical** RPM via tach → duty PI |
+| `rpm_kp` | float | Optional | `0.003` | Proportional gain (duty per RPM error) for closed-loop speed |
+| `rpm_ki` | float | Optional | `0.015` | Integral gain (duty per RPM·s) for closed-loop speed |
+| `rpm_max_duty` | float | Optional | `1.0` | Max |duty| the RPM loop may command |
 
 CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VESC CAN protocol](https://github.com/vedderb/bldc/blob/master/documentation/comm_can.md) and the [erh/vesccan](https://github.com/erh/vesccan) reference module.
 
 **Position (CAN):** `GetPosition` uses the STATUS_5 (`0x1B00 \| id`) **tachometer** (signed int32 in bytes 0–3). Revolutions = `(tachometer − zero) / ticks_per_rotation`. `attributes.id` must match the VESC id in that frame. Call `ResetZeroPosition` after startup before measuring travel. DoCommand `{"command":"get_position_debug"}` shows whether STATUS_5 was seen. Serial still uses a software counter.
+
+**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and adjusts duty until it matches. No `pole_pairs` needed. Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm` and `rpm_cmd_duty`.
 
 **SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
 

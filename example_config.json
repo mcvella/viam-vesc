@@ -19,7 +19,8 @@
         "transport": "can",
         "interface": "can0",
         "id": 1,
-        "ticks_per_rotation": 100
+        "ticks_per_rotation": 100,
+        "closed_loop_rpm": true
       }
     },
     {
@@ -30,7 +31,8 @@
         "transport": "can",
         "interface": "can0",
         "id": 2,
-        "ticks_per_rotation": 100
+        "ticks_per_rotation": 100,
+        "closed_loop_rpm": true
       }
     }
   ],

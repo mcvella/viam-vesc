@@ -63,6 +63,16 @@ class Vesc(Motor, EasyResource):
         self._tach_zero_initialized = False
         self._position_offset = 0.0
         self._warned_missing_status5 = False
+        # Closed-loop mechanical RPM (tach feedback → duty). No pole_pairs needed.
+        self._closed_loop_rpm = True
+        self._rpm_kp = 0.003
+        self._rpm_ki = 0.015
+        self._rpm_max_duty = 1.0
+        self._rpm_integral = 0.0
+        self._rpm_cmd_duty = 0.0
+        self._measured_rpm = 0.0
+        self._rpm_tach_last: Optional[float] = None
+        self._rpm_tach_last_ts: Optional[float] = None
 
     @classmethod
     def new(
@@ -144,14 +154,34 @@ class Vesc(Motor, EasyResource):
         self._tach_zero_initialized = False
         self._position_offset = 0.0
         self._warned_missing_status5 = False
+        # Default on for CAN so SetRPM is mechanical RPM via tach feedback.
+        self._closed_loop_rpm = _as_bool(
+            attributes.get("closed_loop_rpm"),
+            self._transport_name == "can",
+        )
+        self._rpm_kp = float(attributes.get("rpm_kp", 0.003))
+        self._rpm_ki = float(attributes.get("rpm_ki", 0.015))
+        self._rpm_max_duty = float(attributes.get("rpm_max_duty", 1.0))
+        if self._rpm_max_duty <= 0 or self._rpm_max_duty > 1.0:
+            self._rpm_max_duty = 1.0
+        self._rpm_integral = 0.0
+        self._rpm_cmd_duty = 0.0
+        self._measured_rpm = 0.0
+        self._rpm_tach_last = None
+        self._rpm_tach_last_ts = None
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
-            "command_interval=%s ticks_per_rotation=%s",
+            "command_interval=%s ticks_per_rotation=%s closed_loop_rpm=%s "
+            "rpm_kp=%s rpm_ki=%s rpm_max_duty=%s",
             self._transport_name,
             self._ramp_up_enabled,
             self._ramp_up_rate,
             self._command_interval,
             self._ticks_per_rotation,
+            self._closed_loop_rpm,
+            self._rpm_kp,
+            self._rpm_ki,
+            self._rpm_max_duty,
         )
 
         try:
@@ -209,16 +239,29 @@ class Vesc(Motor, EasyResource):
                     except asyncio.CancelledError:
                         pass
 
+    def _can_use_rpm_closed_loop(self) -> bool:
+        """True when we should treat SetRPM as mechanical RPM with tach feedback."""
+        if not self._closed_loop_rpm:
+            return False
+        if self._transport_name != "can" or self._transport is None:
+            return False
+        return self._transport.get_tachometer() is not None
+
     def _start_rpm_keepalive(self, rpm: float) -> None:
-        """Caller must hold `_lock`. Starts repeating SET_RPM to defeat CAN timeout."""
+        """Caller must hold `_lock`. Starts RPM keepalive / closed-loop speed task."""
         self._target_rpm = rpm
         self._current_rpm = rpm
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
+        self._rpm_integral = 0.0
+        self._rpm_cmd_duty = 0.0
+        self._measured_rpm = 0.0
+        self._rpm_tach_last = None
+        self._rpm_tach_last_ts = None
         if rpm == 0.0:
             return
         self._stop_rpm_task = False
-        self._rpm_task = asyncio.create_task(self._rpm_keepalive_task())
+        self._rpm_task = asyncio.create_task(self._rpm_control_task())
 
     @dataclass
     class Properties(Motor.Properties):
@@ -300,9 +343,13 @@ class Vesc(Motor, EasyResource):
         await self._halt_control_tasks()
         async with self._lock:
             transport = self._require_transport()
-            if not transport.set_rpm(signed_rpm):
-                raise RuntimeError("Failed to set RPM for GoFor")
-            self._start_rpm_keepalive(signed_rpm)
+            closed = self._can_use_rpm_closed_loop()
+            if closed:
+                self._start_rpm_keepalive(signed_rpm)
+            else:
+                if not transport.set_rpm(signed_rpm):
+                    raise RuntimeError("Failed to set RPM for GoFor")
+                self._start_rpm_keepalive(signed_rpm)
 
         self.logger.info(
             "GoFor: start=%.3f target=%.3f rev=%.3f rpm=%.1f",
@@ -456,15 +503,35 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ):
-        """Set the motor RPM (with CAN keepalive so the VESC does not time out)."""
+        """Set motor speed.
+
+        With CAN + tachometer and closed_loop_rpm (default on CAN), ``rpm`` is
+        mechanical shaft RPM: a PI loop measures tach speed and adjusts duty.
+        Otherwise ``rpm`` is sent as open-loop VESC ERPM (with keepalive).
+        """
         await self._halt_control_tasks()
         async with self._lock:
             try:
                 transport = self._require_transport()
-                if not transport.set_rpm(rpm):
-                    raise RuntimeError("Failed to set RPM")
-                self._start_rpm_keepalive(rpm)
-                self.logger.info(f"Set RPM to {rpm}")
+                closed = self._can_use_rpm_closed_loop()
+                if closed:
+                    # Kick with duty from the control loop; no open-loop ERPM.
+                    self._start_rpm_keepalive(rpm)
+                    self.logger.info(
+                        "Set mechanical RPM to %.1f (closed-loop tach/duty)", rpm
+                    )
+                else:
+                    if not transport.set_rpm(rpm):
+                        raise RuntimeError("Failed to set RPM")
+                    self._start_rpm_keepalive(rpm)
+                    if self._closed_loop_rpm and self._transport_name == "can":
+                        self.logger.warning(
+                            "SetRPM %.1f as open-loop ERPM (no STATUS_5 tach yet); "
+                            "closed-loop mechanical RPM needs tachometer",
+                            rpm,
+                        )
+                    else:
+                        self.logger.info("Set open-loop ERPM to %.1f", rpm)
             except Exception as e:
                 self.logger.error(f"Failed to set RPM: {e}")
                 raise RuntimeError(f"Failed to set RPM: {e}")
@@ -568,6 +635,9 @@ class Vesc(Motor, EasyResource):
             self._is_powered = False
             self._current_power = 0.0
             self._current_rpm = 0.0
+            self._measured_rpm = 0.0
+            self._rpm_integral = 0.0
+            self._rpm_cmd_duty = 0.0
             self._is_moving = False
             self.logger.info("Motor stopped")
 
@@ -647,6 +717,10 @@ class Vesc(Motor, EasyResource):
                 "is_powered": self._is_powered,
                 "current_power": self._current_power,
                 "current_rpm": self._current_rpm,
+                "measured_rpm": self._measured_rpm,
+                "target_rpm": self._target_rpm,
+                "rpm_cmd_duty": self._rpm_cmd_duty,
+                "closed_loop_rpm": self._closed_loop_rpm,
                 "is_moving": self._is_moving,
                 "position": self._position,
                 "debug_mode": self._debug_mode,
@@ -748,6 +822,9 @@ class Vesc(Motor, EasyResource):
                 self._is_powered = False
                 self._current_power = 0.0
                 self._current_rpm = 0.0
+                self._measured_rpm = 0.0
+                self._rpm_integral = 0.0
+                self._rpm_cmd_duty = 0.0
                 self._is_moving = False
                 self._current_ramp_power = 0.0
             return {
@@ -782,23 +859,98 @@ class Vesc(Motor, EasyResource):
         if transport:
             transport.close()
 
-    async def _rpm_keepalive_task(self):
-        """Re-send SET_RPM so the VESC CAN/UART timeout (~0.5s) does not stop the motor."""
+    async def _rpm_control_task(self):
+        """Keepalive + optional closed-loop mechanical RPM via tach → duty.
+
+        Closed-loop (CAN + tach): target is shaft RPM; PI adjusts duty so
+        measured tach speed matches. Open-loop: re-send SET_RPM (ERPM).
+        """
+        last_logged = 0.0
         while True:
             try:
                 async with self._lock:
                     if self._stop_rpm_task:
                         return
                     transport = self._transport
-                    rpm = self._target_rpm
+                    target = self._target_rpm
                     interval = self._command_interval
-                if transport is not None:
-                    transport.set_rpm(rpm)
+                    ticks = self._ticks_per_rotation
+                    kp = self._rpm_kp
+                    ki = self._rpm_ki
+                    max_duty = self._rpm_max_duty
+                    closed = (
+                        self._closed_loop_rpm
+                        and self._transport_name == "can"
+                        and transport is not None
+                    )
+                    integral = self._rpm_integral
+                    tach_last = self._rpm_tach_last
+                    tach_last_ts = self._rpm_tach_last_ts
+
+                if transport is None:
+                    await asyncio.sleep(interval)
+                    continue
+
+                if not closed or transport.get_tachometer() is None:
+                    transport.set_rpm(target)
+                    await asyncio.sleep(interval)
+                    continue
+
+                tach = transport.get_tachometer()
+                now = time.monotonic()
+                measured = 0.0
+                dt = interval
+                if (
+                    tach is not None
+                    and tach_last is not None
+                    and tach_last_ts is not None
+                ):
+                    dt = max(now - tach_last_ts, 1e-3)
+                    # Cap dt so a pause cannot create a huge spike.
+                    dt = min(dt, 0.1)
+                    drevs = (tach - tach_last) / ticks
+                    measured = (drevs / dt) * 60.0
+
+                if tach is not None:
+                    tach_last = tach
+                    tach_last_ts = now
+
+                error = target - measured
+                integral += error * dt
+
+                raw = kp * error + ki * integral
+                duty = max(-max_duty, min(max_duty, raw))
+                # Anti-windup: undo integration when saturated in error direction.
+                if abs(raw) > max_duty and error * raw > 0:
+                    integral -= error * dt
+
+                transport.set_duty(duty)
+
+                async with self._lock:
+                    self._rpm_integral = integral
+                    self._rpm_cmd_duty = duty
+                    self._measured_rpm = measured
+                    self._current_rpm = measured
+                    self._current_power = duty
+                    self._rpm_tach_last = tach_last
+                    self._rpm_tach_last_ts = tach_last_ts
+                    self._is_moving = abs(measured) > 1.0 or abs(target) > 0.0
+
+                if now - last_logged >= 0.5:
+                    self.logger.info(
+                        "RPM loop: target=%.1f meas=%.1f duty=%.3f err=%.1f",
+                        target,
+                        measured,
+                        duty,
+                        error,
+                    )
+                    last_logged = now
+
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.error(f"RPM keepalive error: {e}")
+                self.logger.error(f"RPM control error: {e}")
                 await asyncio.sleep(self._command_interval)
 
     async def _simple_power_task(self):
