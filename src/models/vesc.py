@@ -249,42 +249,85 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ):
-        """Go for a specific number of revolutions at a given RPM"""
-        if revolutions == 0:
+        """Go for a specific number of revolutions at a given RPM.
+
+        On CAN with tachometer odometry, runs closed-loop until the measured
+        position reaches the target. Serial (no encoder) falls back to timed motion.
+        """
+        if revolutions == 0 or rpm == 0:
             await self.stop()
             return
 
-        success = False
-        time_needed = 0.0
+        # Direction from revolutions; magnitude from |rpm|.
+        signed_rpm = abs(rpm) if revolutions > 0 else -abs(rpm)
+        start = await self.get_position()
+        target = start + revolutions
+
+        await self._halt_power_task()
         async with self._lock:
             transport = self._require_transport()
-            try:
-                if transport.set_rpm(rpm):
-                    success = True
-                    self.logger.info(f"Set RPM to {rpm}")
-            except Exception as e:
-                self.logger.debug(f"RPM control failed: {e}")
+            if not transport.set_rpm(signed_rpm):
+                raise RuntimeError("Failed to set RPM for GoFor")
+            self._current_rpm = signed_rpm
+            self._is_powered = True
+            self._is_moving = True
 
-            if success:
-                self._current_rpm = rpm
-                self._is_powered = True
-                self._is_moving = True
-                if rpm != 0:
-                    time_needed = abs(revolutions / rpm) * 60.0
+        self.logger.info(
+            "GoFor: start=%.3f target=%.3f rev=%.3f rpm=%.1f",
+            start,
+            target,
+            revolutions,
+            signed_rpm,
+        )
 
-        if success:
-            if rpm != 0:
-                await asyncio.sleep(time_needed)
-                await self.stop()
-                async with self._lock:
-                    self._position += revolutions
-            return
+        # Prefer closed-loop on CAN tachometer; timed fallback otherwise.
+        use_odometry = (
+            self._transport_name == "can"
+            and self._transport is not None
+            and self._transport.get_tachometer() is not None
+        )
 
-        self.logger.warning("RPM control failed, using power control fallback")
-        power = 0.5 if rpm > 0 else -0.5
-        await self.set_power(power)
-        await asyncio.sleep(2.0)
+        if use_odometry:
+            await self._wait_for_position(target, revolutions > 0, abs(revolutions), abs(rpm))
+        else:
+            time_needed = abs(revolutions / rpm) * 60.0
+            self.logger.warning(
+                "GoFor using timed motion (%.2fs); no tachometer odometry",
+                time_needed,
+            )
+            await asyncio.sleep(time_needed)
+            async with self._lock:
+                self._position = target
+
         await self.stop()
+
+    async def _wait_for_position(
+        self,
+        target: float,
+        moving_positive: bool,
+        distance_revs: float,
+        rpm_abs: float,
+    ) -> None:
+        """Poll GetPosition until target is reached or timeout."""
+        # Allow 2x nominal time plus 2s margin; poll at ~50Hz.
+        nominal_s = (distance_revs / max(rpm_abs, 1e-6)) * 60.0
+        deadline = time.monotonic() + max(nominal_s * 2.0, 2.0) + 2.0
+        tolerance = max(0.02, 1.0 / max(abs(self._ticks_per_rotation), 1.0))
+
+        while time.monotonic() < deadline:
+            pos = await self.get_position()
+            if moving_positive and pos >= target - tolerance:
+                self.logger.info("GoFor/GoTo reached target pos=%.3f", pos)
+                return
+            if not moving_positive and pos <= target + tolerance:
+                self.logger.info("GoFor/GoTo reached target pos=%.3f", pos)
+                return
+            await asyncio.sleep(0.02)
+
+        pos = await self.get_position()
+        self.logger.warning(
+            "GoFor/GoTo timed out at pos=%.3f (target=%.3f)", pos, target
+        )
 
     async def go_to(
         self,
@@ -295,12 +338,19 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ):
-        """Go to a specific position at a given RPM"""
-        target_position = position_revolutions
-        current_position = self._position
-        revolutions_needed = target_position - current_position
-
-        await self.go_for(rpm, revolutions_needed, extra=extra, timeout=timeout, **kwargs)
+        """Go to an absolute position (revolutions) at a given RPM."""
+        current_position = await self.get_position()
+        revolutions_needed = position_revolutions - current_position
+        self.logger.info(
+            "GoTo: current=%.3f target=%.3f delta=%.3f rpm=%.1f",
+            current_position,
+            position_revolutions,
+            revolutions_needed,
+            rpm,
+        )
+        await self.go_for(
+            rpm, revolutions_needed, extra=extra, timeout=timeout, **kwargs
+        )
 
     async def set_rpm(
         self,
@@ -310,7 +360,8 @@ class Vesc(Motor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ):
-        """Set the motor RPM"""
+        """Set the motor RPM (halts duty keepalive so it cannot fight RPM mode)."""
+        await self._halt_power_task()
         async with self._lock:
             try:
                 transport = self._require_transport()
