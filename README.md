@@ -63,7 +63,7 @@ CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VES
 
 **Position (CAN):** `GetPosition` uses the STATUS_5 (`0x1B00 \| id`) **tachometer** (signed int32 in bytes 0–3). Revolutions = `(tachometer − zero) / ticks_per_rotation`. `attributes.id` must match the VESC id in that frame. Call `ResetZeroPosition` after startup before measuring travel. DoCommand `{"command":"get_position_debug"}` shows whether STATUS_5 was seen. Serial still uses a software counter.
 
-**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and adjusts duty until it matches. No `pole_pairs` needed. Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm` and `rpm_cmd_duty`.
+**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and adjusts duty until it matches. No `pole_pairs` needed. Duty changes respect `ramp_up_enabled` / `ramp_up_rate`. Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm` and `rpm_cmd_duty`.
 
 **SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
 
@@ -162,12 +162,12 @@ If you are unsure, leave this option out (default is `int`). CAN always uses the
 
 ## Ramp-Up / Ramp-Down Behavior
 
-By default, the module ramps motor power toward the new target instead of jumping instantly.
+By default, the module ramps motor **duty** toward the new target instead of jumping instantly. This applies to `SetPower` and to closed-loop `SetRPM` / `GoFor` / `GoTo` (the duty the speed loop commands is slew-limited).
 
 | Attribute | Default | Meaning |
 |-----------|---------|---------|
-| `ramp_up_enabled` | `true` | When `false`, power changes immediately. |
-| `ramp_up_rate` | `0.25` | Max change in power **per second** (power is −1.0…1.0). |
+| `ramp_up_enabled` | `true` | When `false`, duty changes immediately. |
+| `ramp_up_rate` | `0.25` | Max change in duty **per second** (duty is −1.0…1.0). |
 | `command_interval` | `0.01` | How often the keepalive/ramp loop ticks (seconds). Does **not** set total ramp time. |
 
 **Time to finish a ramp:**

@@ -263,8 +263,8 @@ class Vesc(Motor, EasyResource):
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
         self._rpm_integral = 0.0
-        self._rpm_cmd_duty = 0.0
-        self._measured_rpm = 0.0
+        # Keep current duty as ramp start (0 after stop; non-zero if already moving).
+        self._rpm_cmd_duty = self._current_power
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
         self._rpm_meas_last_ts = None
@@ -893,6 +893,9 @@ class Vesc(Motor, EasyResource):
                     ki = self._rpm_ki
                     max_duty = self._rpm_max_duty
                     duty_ref = self._rpm_duty_ref
+                    ramp_enabled = self._ramp_up_enabled
+                    ramp_rate = self._ramp_up_rate
+                    prev_duty = self._rpm_cmd_duty
                     closed = (
                         self._closed_loop_rpm
                         and self._transport_name == "can"
@@ -953,9 +956,23 @@ class Vesc(Motor, EasyResource):
                 auth = min(max_duty, max(0.05, abs(target) / duty_ref + 0.05))
 
                 raw = kp * error + ki * integral
-                duty = max(-auth, min(auth, raw))
+                desired = max(-auth, min(auth, raw))
                 if abs(raw) > auth and error * raw > 0:
                     integral -= error * interval
+
+                # Same duty slew as SetPower when ramp_up_enabled.
+                if ramp_enabled and ramp_rate > 0:
+                    max_step = ramp_rate * interval
+                    delta = desired - prev_duty
+                    if abs(delta) > max_step:
+                        duty = prev_duty + (max_step if delta > 0 else -max_step)
+                        # Don't wind integral while slew-limited toward the error.
+                        if error * (desired - duty) > 0:
+                            integral -= error * interval
+                    else:
+                        duty = desired
+                else:
+                    duty = desired
 
                 transport.set_duty(duty)
 
@@ -972,10 +989,12 @@ class Vesc(Motor, EasyResource):
 
                 if now - last_logged >= 0.5:
                     self.logger.info(
-                        "RPM loop: target=%.1f meas=%.1f duty=%.3f auth=%.3f err=%.1f",
+                        "RPM loop: target=%.1f meas=%.1f duty=%.3f desired=%.3f "
+                        "auth=%.3f err=%.1f",
                         target,
                         measured,
                         duty,
+                        desired,
                         auth,
                         error,
                     )
