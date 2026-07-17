@@ -77,6 +77,11 @@ class Vesc(Motor, EasyResource):
         self._rpm_tach_last: Optional[float] = None
         self._rpm_tach_last_ts: Optional[float] = None
         self._rpm_meas_last_ts: Optional[float] = None
+        # Proportional RPM setpoint ramp (preserves L/R ratio for differential drive).
+        self._rpm_goal = 0.0
+        self._rpm_setpoint = 0.0
+        self._rpm_ramp_from = 0.0
+        self._rpm_ramp_progress = 1.0
 
     @classmethod
     def new(
@@ -177,6 +182,10 @@ class Vesc(Motor, EasyResource):
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
         self._rpm_meas_last_ts = None
+        self._rpm_goal = 0.0
+        self._rpm_setpoint = 0.0
+        self._rpm_ramp_from = 0.0
+        self._rpm_ramp_progress = 1.0
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
             "command_interval=%s ticks_per_rotation=%s closed_loop_rpm=%s "
@@ -258,17 +267,31 @@ class Vesc(Motor, EasyResource):
 
     def _start_rpm_keepalive(self, rpm: float) -> None:
         """Caller must hold `_lock`. Starts RPM keepalive / closed-loop speed task."""
+        self._rpm_goal = rpm
         self._target_rpm = rpm
-        self._current_rpm = rpm
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
         self._rpm_integral = 0.0
-        # Keep current duty as ramp start (0 after stop; non-zero if already moving).
+        # Keep current duty; PI will track the ramping setpoint.
         self._rpm_cmd_duty = self._current_power
-        self._rpm_tach_last = None
-        self._rpm_tach_last_ts = None
-        self._rpm_meas_last_ts = None
+        # Do not clear tach speed history here — mid-motion SetVelocity updates
+        # would otherwise briefly read 0 RPM and spike duty.
+        # Ramp the RPM *setpoint* (not duty). Same progress rate on every motor
+        # keeps left/right ratio constant — required for SetVelocity turn-in-place
+        # vs straight. Absolute duty slew made both sides match during ramp → mostly straight.
+        self._rpm_ramp_from = self._rpm_setpoint
+        if self._ramp_up_enabled and self._ramp_up_rate > 0 and rpm != self._rpm_setpoint:
+            self._rpm_ramp_progress = 0.0
+        else:
+            self._rpm_ramp_progress = 1.0
+            self._rpm_setpoint = rpm
         if rpm == 0.0:
+            self._rpm_setpoint = 0.0
+            self._rpm_ramp_progress = 1.0
+            self._rpm_cmd_duty = 0.0
+            self._current_power = 0.0
+            if self._transport is not None:
+                self._transport.set_duty(0.0)
             return
         self._stop_rpm_task = False
         self._rpm_task = asyncio.create_task(self._rpm_control_task())
@@ -642,6 +665,9 @@ class Vesc(Motor, EasyResource):
 
             self._target_power = 0.0
             self._target_rpm = 0.0
+            self._rpm_goal = 0.0
+            self._rpm_setpoint = 0.0
+            self._rpm_ramp_progress = 1.0
             self._is_powered = False
             self._current_power = 0.0
             self._current_rpm = 0.0
@@ -729,6 +755,8 @@ class Vesc(Motor, EasyResource):
                 "current_rpm": self._current_rpm,
                 "measured_rpm": self._measured_rpm,
                 "target_rpm": self._target_rpm,
+                "rpm_setpoint": self._rpm_setpoint,
+                "rpm_ramp_progress": self._rpm_ramp_progress,
                 "rpm_cmd_duty": self._rpm_cmd_duty,
                 "closed_loop_rpm": self._closed_loop_rpm,
                 "is_moving": self._is_moving,
@@ -829,6 +857,9 @@ class Vesc(Motor, EasyResource):
                     }
                 self._target_power = 0.0
                 self._target_rpm = 0.0
+                self._rpm_goal = 0.0
+                self._rpm_setpoint = 0.0
+                self._rpm_ramp_progress = 1.0
                 self._is_powered = False
                 self._current_power = 0.0
                 self._current_rpm = 0.0
@@ -875,9 +906,11 @@ class Vesc(Motor, EasyResource):
         Closed-loop (CAN + tach): target is shaft RPM; PI adjusts duty so
         measured tach speed matches. Open-loop: re-send SET_RPM (ERPM).
 
-        Speed is only recomputed when the tachometer value changes. Unchanged
-        samples hold the last measurement (treating them as 0 RPM was winding
-        duty to 100% between STATUS_5 frames).
+        When ramp_up_enabled, the RPM *setpoint* ramps as a fraction of the
+        goal change per second (``ramp_up_rate``). That keeps left/right
+        speed ratio constant during a wheeled-base SetVelocity (linear+angular).
+        Duty is not slew-limited here — absolute duty ramps made both motors
+        climb together and go mostly straight until the slower side finished.
         """
         last_logged = 0.0
         while True:
@@ -886,7 +919,7 @@ class Vesc(Motor, EasyResource):
                     if self._stop_rpm_task:
                         return
                     transport = self._transport
-                    target = self._target_rpm
+                    goal = self._rpm_goal
                     interval = self._command_interval
                     ticks = self._ticks_per_rotation
                     kp = self._rpm_kp
@@ -895,7 +928,8 @@ class Vesc(Motor, EasyResource):
                     duty_ref = self._rpm_duty_ref
                     ramp_enabled = self._ramp_up_enabled
                     ramp_rate = self._ramp_up_rate
-                    prev_duty = self._rpm_cmd_duty
+                    ramp_from = self._rpm_ramp_from
+                    ramp_progress = self._rpm_ramp_progress
                     closed = (
                         self._closed_loop_rpm
                         and self._transport_name == "can"
@@ -911,8 +945,22 @@ class Vesc(Motor, EasyResource):
                     await asyncio.sleep(interval)
                     continue
 
+                # Proportional setpoint ramp: progress 0→1 at ramp_up_rate / second.
+                # Duration is the same for every motor (≈ 1/rate), so L/R ratio holds.
+                if ramp_enabled and ramp_rate > 0 and ramp_progress < 1.0:
+                    ramp_progress = min(1.0, ramp_progress + ramp_rate * interval)
+                    setpoint = ramp_from + (goal - ramp_from) * ramp_progress
+                else:
+                    ramp_progress = 1.0
+                    setpoint = goal
+
                 if not closed or transport.get_tachometer() is None:
-                    transport.set_rpm(target)
+                    transport.set_rpm(setpoint)
+                    async with self._lock:
+                        self._rpm_setpoint = setpoint
+                        self._rpm_ramp_progress = ramp_progress
+                        self._target_rpm = goal
+                        self._current_rpm = setpoint
                     await asyncio.sleep(interval)
                     continue
 
@@ -943,42 +991,32 @@ class Vesc(Motor, EasyResource):
                     # No tach motion for a while → treat as stopped.
                     measured = 0.0
 
-                error = target - measured
+                error = setpoint - measured
                 integral += error * interval
                 # Bound integral so a stall cannot store a huge rewind.
-                # Cap roughly to what would produce ±max_duty via Ki alone.
                 if ki > 1e-9:
                     i_lim = (max_duty / ki) * 1.5
                     integral = max(-i_lim, min(i_lim, integral))
 
-                # Target-scaled duty ceiling: SetRPM(1) must not be allowed 100%.
-                # |target|/duty_ref + 5% floor, then clamp to rpm_max_duty.
-                auth = min(max_duty, max(0.05, abs(target) / duty_ref + 0.05))
+                # Authority scales with |setpoint| so left/right don't share the same
+                # duty floor early in a differential ramp (that recreated "go straight").
+                # Full ~5% start assist only once |setpoint| is meaningful (~25 RPM).
+                floor = 0.05 * min(1.0, abs(setpoint) / 25.0)
+                auth = min(max_duty, abs(setpoint) / duty_ref + floor)
 
                 raw = kp * error + ki * integral
-                desired = max(-auth, min(auth, raw))
+                duty = max(-auth, min(auth, raw))
                 if abs(raw) > auth and error * raw > 0:
                     integral -= error * interval
-
-                # Same duty slew as SetPower when ramp_up_enabled.
-                if ramp_enabled and ramp_rate > 0:
-                    max_step = ramp_rate * interval
-                    delta = desired - prev_duty
-                    if abs(delta) > max_step:
-                        duty = prev_duty + (max_step if delta > 0 else -max_step)
-                        # Don't wind integral while slew-limited toward the error.
-                        if error * (desired - duty) > 0:
-                            integral -= error * interval
-                    else:
-                        duty = desired
-                else:
-                    duty = desired
 
                 transport.set_duty(duty)
 
                 async with self._lock:
                     self._rpm_integral = integral
                     self._rpm_cmd_duty = duty
+                    self._rpm_setpoint = setpoint
+                    self._rpm_ramp_progress = ramp_progress
+                    self._target_rpm = goal
                     self._measured_rpm = measured
                     self._current_rpm = measured
                     self._current_power = duty
@@ -989,12 +1027,13 @@ class Vesc(Motor, EasyResource):
 
                 if now - last_logged >= 0.5:
                     self.logger.info(
-                        "RPM loop: target=%.1f meas=%.1f duty=%.3f desired=%.3f "
-                        "auth=%.3f err=%.1f",
-                        target,
+                        "RPM loop: goal=%.1f set=%.1f meas=%.1f duty=%.3f "
+                        "prog=%.2f auth=%.3f err=%.1f",
+                        goal,
+                        setpoint,
                         measured,
                         duty,
-                        desired,
+                        ramp_progress,
                         auth,
                         error,
                     )
