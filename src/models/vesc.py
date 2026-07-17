@@ -271,7 +271,14 @@ class Vesc(Motor, EasyResource):
         self._target_rpm = rpm
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
-        self._rpm_integral = 0.0
+        # Bumpless transfer: seed the integral so the loop resumes near the
+        # current duty instead of collapsing to kp*error on every SetRPM. At
+        # ramp start error≈0, so ki*integral ≈ current duty holds motor speed.
+        # Zeroing here made repeated SetRPM dip power while the integral rebuilt.
+        if self._rpm_ki > 1e-9 and rpm != 0.0:
+            self._rpm_integral = self._current_power / self._rpm_ki
+        else:
+            self._rpm_integral = 0.0
         # Keep current duty; PI will track the ramping setpoint.
         self._rpm_cmd_duty = self._current_power
         # Do not clear tach speed history here — mid-motion SetVelocity updates
