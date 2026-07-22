@@ -65,15 +65,16 @@ class Vesc(Motor, EasyResource):
         self._warned_missing_status5 = False
         # Closed-loop mechanical RPM (tach feedback → motor current). No pole_pairs.
         self._closed_loop_rpm = True
-        # Defaults tuned for hub-motor / AGV shaft speeds (tens of RPM), not ERPM.
-        self._rpm_kp = 0.1  # A per RPM error (~1 A at 10 RPM error)
-        self._rpm_ki = 0.25  # A per RPM·s
+        # Feedforward carries most torque; these gains are a slow tach trim only.
+        # High kp/ki + sparse STATUS_5 made SetRPM/GoFor pulse (SetPower was fine).
+        self._rpm_kp = 0.02  # A per RPM error (trim)
+        self._rpm_ki = 0.05  # A per RPM·s (trim)
         self._rpm_max_current = 15.0  # hard |current| cap (A); raise for heavier drives
         # Soft authority reaches rpm_max_current near this shaft RPM (+ small % floor).
         self._rpm_current_ref = 150.0
-        self._rpm_breakaway_current = 8.0  # A while stuck near 0 RPM
-        self._rpm_breakaway_rpm = 3.0  # below this = "not moving yet"
-        self._rpm_stall_timeout = 0.1  # s of near-zero before breakaway boost
+        self._rpm_breakaway_current = 6.0  # A, one-shot assist from standstill only
+        self._rpm_breakaway_rpm = 2.0  # below this = "not moving yet"
+        self._rpm_stall_timeout = 0.08  # s of near-zero before breakaway boost
         self._rpm_integral = 0.0
         self._rpm_cmd_current = 0.0
         self._rpm_stall_since: Optional[float] = None
@@ -173,8 +174,8 @@ class Vesc(Motor, EasyResource):
             attributes.get("closed_loop_rpm"),
             self._transport_name == "can",
         )
-        self._rpm_kp = float(attributes.get("rpm_kp", 0.1))
-        self._rpm_ki = float(attributes.get("rpm_ki", 0.25))
+        self._rpm_kp = float(attributes.get("rpm_kp", 0.02))
+        self._rpm_ki = float(attributes.get("rpm_ki", 0.05))
         self._rpm_max_current = float(attributes.get("rpm_max_current", 15.0))
         if self._rpm_max_current <= 0:
             self._rpm_max_current = 15.0
@@ -182,19 +183,19 @@ class Vesc(Motor, EasyResource):
         if self._rpm_current_ref < 10.0:
             self._rpm_current_ref = 10.0
         self._rpm_breakaway_current = float(
-            attributes.get("rpm_breakaway_current", 8.0)
+            attributes.get("rpm_breakaway_current", 6.0)
         )
         if self._rpm_breakaway_current < 0:
             self._rpm_breakaway_current = 0.0
         self._rpm_breakaway_current = min(
             self._rpm_breakaway_current, self._rpm_max_current
         )
-        self._rpm_breakaway_rpm = float(attributes.get("rpm_breakaway_rpm", 3.0))
+        self._rpm_breakaway_rpm = float(attributes.get("rpm_breakaway_rpm", 2.0))
         if self._rpm_breakaway_rpm < 0:
-            self._rpm_breakaway_rpm = 3.0
-        self._rpm_stall_timeout = float(attributes.get("rpm_stall_timeout", 0.1))
+            self._rpm_breakaway_rpm = 2.0
+        self._rpm_stall_timeout = float(attributes.get("rpm_stall_timeout", 0.08))
         if self._rpm_stall_timeout < 0:
-            self._rpm_stall_timeout = 0.1
+            self._rpm_stall_timeout = 0.08
         self._rpm_integral = 0.0
         self._rpm_cmd_current = 0.0
         self._rpm_stall_since = None
@@ -296,10 +297,11 @@ class Vesc(Motor, EasyResource):
         self._target_rpm = rpm
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
-        # Bumpless transfer: seed the integral so the loop resumes near the
-        # current command instead of collapsing to kp*error on every SetRPM.
-        if self._rpm_ki > 1e-9 and rpm != 0.0:
-            self._rpm_integral = self._rpm_cmd_current / self._rpm_ki
+        # Feedforward carries the bulk of the command; keep trim integral small
+        # so a new SetRPM/GoFor does not inherit a huge rewind from the last move.
+        if self._rpm_ki > 1e-9 and rpm != 0.0 and self._rpm_current_ref > 1e-9:
+            ff = (rpm / self._rpm_current_ref) * self._rpm_max_current
+            self._rpm_integral = (self._rpm_cmd_current - ff) / self._rpm_ki
         else:
             self._rpm_integral = 0.0
         # Ramp the RPM *setpoint* (not current). Same progress rate on every motor
@@ -1035,74 +1037,71 @@ class Vesc(Motor, EasyResource):
                     real_dt = min(real_dt, 0.5)
                     drevs = (tach - tach_last) / ticks
                     instant = (drevs / real_dt) * 60.0
-                    # Light EMA to tame single-tick quantization noise.
-                    measured = 0.4 * instant + 0.6 * measured
+                    # Heavy EMA: STATUS_5 ticks are sparse; chasing them pulses torque.
+                    measured = 0.9 * measured + 0.1 * instant
                     tach_last = tach
                     tach_last_ts = now
                     meas_last_ts = now
-                elif tach_last is not None and tach_last_ts is not None:
-                    # No new tick yet: do NOT snap measured to 0 (that retriggers
-                    # breakaway and makes spin pulse). Cap |RPM| by how long it
-                    # has been since the last tick (one tick / dt).
-                    dt = max(now - tach_last_ts, 1e-3)
-                    tick_rpm = (1.0 / max(abs(ticks), 1e-9) / dt) * 60.0
-                    if tick_rpm < 0.5:
+                elif tach_last_ts is not None and (now - tach_last_ts) > 0.6:
+                    # Hold speed between ticks. Only bleed to 0 after a long gap.
+                    measured *= 0.92
+                    if abs(measured) < 0.5:
                         measured = 0.0
-                    elif abs(measured) > tick_rpm:
-                        measured = (
-                            tick_rpm if measured > 0 else -tick_rpm
-                        )
+
+                # Feedforward from setpoint (smooth, like SetPower). Tach PI is
+                # only a slow trim — sparse encoder feedback must not own torque.
+                sp_scale = min(1.0, abs(setpoint) / 25.0)
+                if abs(setpoint) < 1e-9 or current_ref < 1e-9:
+                    ff = 0.0
+                else:
+                    ff = (setpoint / current_ref) * max_current
+                    # Tiny crawl floor so very low RPM still produces some torque.
+                    ff_floor = 0.03 * max_current * sp_scale
+                    if 0.0 < abs(ff) < ff_floor:
+                        ff = ff_floor if ff > 0 else -ff_floor
+                ff = max(-max_current, min(max_current, ff))
 
                 error = setpoint - measured
                 integral += error * interval
-                # Bound integral so a stall cannot store a huge rewind.
+                # Trim-only integral authority (~25% of max).
                 if ki > 1e-9:
-                    i_lim = (max_current / ki) * 1.5
+                    i_lim = (0.25 * max_current) / ki
                     integral = max(-i_lim, min(i_lim, integral))
 
-                # Soft authority scales with |setpoint| so tiny crawl/spin
-                # commands cannot saturate to full current while the loop learns.
-                # Floor is a small fixed % of max current (not breakaway amps) —
-                # using breakaway here made low-RPM auth huge and jerky.
-                sp_scale = min(1.0, abs(setpoint) / 25.0)
-                floor = 0.05 * max_current * sp_scale
-                auth = min(
-                    max_current,
-                    abs(setpoint) / current_ref * max_current + floor,
-                )
-
-                raw = kp * error + ki * integral
-                current = max(-auth, min(auth, raw))
-                if abs(raw) > auth and error * raw > 0:
+                trim = kp * error + ki * integral
+                # Cap trim so tach noise cannot overpower feedforward.
+                trim_lim = 0.35 * max_current
+                trim = max(-trim_lim, min(trim_lim, trim))
+                current = max(-max_current, min(max_current, ff + trim))
+                if abs(trim) >= trim_lim and error * trim > 0:
                     integral -= error * interval
 
-                # Stall / breakaway (separate from soft auth): assist only to
-                # leave a true standstill. After first motion, latch broke_free
-                # so sparse tach ticks cannot re-trigger boost (that pulsed spin).
-                # A long re-stall (e.g. hit an obstacle) can assist again.
                 if abs(measured) >= breakaway_rpm:
                     broke_free = True
                     stall_since = None
 
+                # One-shot standstill assist only (never re-pulse after motion).
                 breakaway_active = False
-                if abs(setpoint) > 0.0 and abs(measured) < breakaway_rpm:
+                if (
+                    not broke_free
+                    and abs(setpoint) > 0.0
+                    and abs(measured) < breakaway_rpm
+                ):
                     if stall_since is None:
                         stall_since = now
                     boost_mag = breakaway_current * sp_scale
-                    need = stall_timeout
-                    if broke_free:
-                        need = max(stall_timeout * 5.0, 0.5)
-                    if (now - stall_since) >= need and boost_mag > 0:
+                    if (now - stall_since) >= stall_timeout and boost_mag > 0:
                         sign = 1.0 if setpoint > 0 else -1.0
                         boost = sign * min(boost_mag, max_current)
-                        if abs(boost) > abs(current) or current * boost <= 0:
+                        if abs(boost) > abs(current):
                             current = boost
                             breakaway_active = True
                 else:
-                    stall_since = None
+                    if broke_free or abs(measured) >= breakaway_rpm:
+                        stall_since = None
 
-                # Slew-limit current so tach quantization cannot torque-pulse.
-                max_di = 30.0 * interval  # A/s
+                # Gentle slew: keep current changes SetPower-smooth.
+                max_di = 12.0 * interval  # A/s
                 if current > prev_current + max_di:
                     current = prev_current + max_di
                 elif current < prev_current - max_di:
@@ -1134,13 +1133,14 @@ class Vesc(Motor, EasyResource):
                 if now - last_logged >= 0.5:
                     self.logger.info(
                         "RPM loop: goal=%.1f set=%.1f meas=%.1f I=%.2fA "
-                        "prog=%.2f auth=%.2f err=%.1f breakaway=%s",
+                        "ff=%.2f trim=%.2f prog=%.2f err=%.1f breakaway=%s",
                         goal,
                         setpoint,
                         measured,
                         current,
+                        ff,
+                        trim,
                         ramp_progress,
-                        auth,
                         error,
                         breakaway_active,
                     )
