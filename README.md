@@ -53,20 +53,16 @@ Use `transport` to select the I/O backend (`serial` default, or `can`).
 | `interface` | string | Required  | —       | Linux CAN device (e.g. `can0`)                   |
 | `id`        | int    | Required  | —       | VESC controller ID on the bus (0–255)            |
 | `ticks_per_rotation` | float | Optional | `1.0` | STATUS_5 tachometer counts per revolution for `GetPosition` / closed-loop RPM |
-| `closed_loop_rpm` | bool | Optional | `true` on CAN | When true (and tach seen), `SetRPM`/`GoFor`/`GoTo` use **mechanical** RPM via tach → current PI |
-| `rpm_kp` | float | Optional | `0.02` | Tach trim P gain (A/RPM); most torque is feedforward from setpoint |
-| `rpm_ki` | float | Optional | `0.05` | Tach trim I gain (A/(RPM·s)); keep low to avoid pulse on sparse tach |
-| `rpm_max_current` | float | Optional | `15` | Hard cap on \|current\| (A) from the RPM loop — raise for heavier hub motors |
-| `rpm_current_ref` | float | Optional | `150` | Soft authority reaches `rpm_max_current` near this shaft RPM (+ 5%·scaled floor) |
-| `rpm_breakaway_current` | float | Optional | `6` | One-shot standstill assist (A); disabled after first motion |
-| `rpm_breakaway_rpm` | float | Optional | `2` | Measured RPM below this counts as “not moving” for stall assist |
-| `rpm_stall_timeout` | float | Optional | `0.08` | Seconds of near-zero measured RPM before applying breakaway current |
+| `closed_loop_rpm` | bool | Optional | `true` on CAN | When true (and tach seen), `SetRPM`/`GoFor`/`GoTo` use **mechanical** RPM via duty map + tach position |
+| `rpm_duty_ref` | float | Optional | `150` | `|duty| ≈ |rpm| / rpm_duty_ref` (e.g. 75 RPM → 0.5 duty) |
+| `rpm_max_duty` | float | Optional | `1.0` | Hard cap on `|duty|` from the RPM loop |
+| `rpm_kp` / `rpm_ki` | float | Optional | `0` | Optional tach trim on duty; leave `0` (recommended) |
 
 CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VESC CAN protocol](https://github.com/vedderb/bldc/blob/master/documentation/comm_can.md) and the [erh/vesccan](https://github.com/erh/vesccan) reference module.
 
 **Position (CAN):** `GetPosition` uses the STATUS_5 (`0x1B00 \| id`) **tachometer** (signed int32 in bytes 0–3). Revolutions = `(tachometer − zero) / ticks_per_rotation`. `attributes.id` must match the VESC id in that frame. Call `ResetZeroPosition` after startup before measuring travel. DoCommand `{"command":"get_position_debug"}` shows whether STATUS_5 was seen. Serial still uses a software counter.
 
-**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and commands **motor current** (`SET_CURRENT`) so VESC FOC supplies torque. Torque is mostly **feedforward** from the RPM setpoint (`I ≈ rpm/rpm_current_ref * rpm_max_current`) with a slow tach trim — matching SetPower smoothness. A one-shot breakaway current may apply from standstill only. No `pole_pairs` needed. RPM setpoints ramp proportionally via `ramp_up_enabled` / `ramp_up_rate` (preserves differential-drive turn ratio). Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm`, `rpm_setpoint`, and `rpm_cmd_current`.
+**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM`/`GoFor` command **duty** from the shaft-RPM setpoint (`duty ≈ rpm / rpm_duty_ref`) — the same smooth actuator path as `SetPower`. Tachometer is used for `GetPosition` / GoFor distance (and Spin/MoveStraight), not for torque feedback. `GoFor` applies the target immediately (no ramp) and honors Viam’s rpm/revolutions sign rule so wheeled-base `Spin` drives left/right opposite ways. `SetVelocity` may still ramp setpoints to keep L/R ratio. Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm`, `rpm_setpoint`, and `rpm_cmd_duty`.
 
 **SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
 

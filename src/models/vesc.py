@@ -63,27 +63,21 @@ class Vesc(Motor, EasyResource):
         self._tach_zero_initialized = False
         self._position_offset = 0.0
         self._warned_missing_status5 = False
-        # Closed-loop mechanical RPM (tach feedback → motor current). No pole_pairs.
+        # Closed-loop mechanical RPM: map shaft RPM → duty (same actuator as SetPower).
+        # Tach is for GetPosition / GoFor distance only — not for torque feedback.
+        # Current-mode + sparse STATUS_5 was erratic; duty keepalive matches SetPower.
         self._closed_loop_rpm = True
-        # Feedforward carries most torque; these gains are a slow tach trim only.
-        # High kp/ki + sparse STATUS_5 made SetRPM/GoFor pulse (SetPower was fine).
-        self._rpm_kp = 0.02  # A per RPM error (trim)
-        self._rpm_ki = 0.05  # A per RPM·s (trim)
-        self._rpm_max_current = 15.0  # hard |current| cap (A); raise for heavier drives
-        # Soft authority reaches rpm_max_current near this shaft RPM (+ small % floor).
-        self._rpm_current_ref = 150.0
-        self._rpm_breakaway_current = 6.0  # A, one-shot assist from standstill only
-        self._rpm_breakaway_rpm = 2.0  # below this = "not moving yet"
-        self._rpm_stall_timeout = 0.08  # s of near-zero before breakaway boost
+        self._rpm_kp = 0.0  # optional duty trim per RPM error (leave 0)
+        self._rpm_ki = 0.0
+        self._rpm_max_duty = 1.0
+        self._rpm_duty_ref = 150.0  # |duty| ≈ |rpm| / rpm_duty_ref
         self._rpm_integral = 0.0
-        self._rpm_cmd_current = 0.0
-        self._rpm_stall_since: Optional[float] = None
-        self._rpm_broke_free = False
+        self._rpm_cmd_duty = 0.0
         self._measured_rpm = 0.0
         self._rpm_tach_last: Optional[float] = None
         self._rpm_tach_last_ts: Optional[float] = None
         self._rpm_meas_last_ts: Optional[float] = None
-        # Proportional RPM setpoint ramp (preserves L/R ratio for differential drive).
+        # Proportional RPM setpoint ramp (preserves L/R ratio for SetVelocity).
         self._rpm_goal = 0.0
         self._rpm_setpoint = 0.0
         self._rpm_ramp_from = 0.0
@@ -174,32 +168,16 @@ class Vesc(Motor, EasyResource):
             attributes.get("closed_loop_rpm"),
             self._transport_name == "can",
         )
-        self._rpm_kp = float(attributes.get("rpm_kp", 0.02))
-        self._rpm_ki = float(attributes.get("rpm_ki", 0.05))
-        self._rpm_max_current = float(attributes.get("rpm_max_current", 15.0))
-        if self._rpm_max_current <= 0:
-            self._rpm_max_current = 15.0
-        self._rpm_current_ref = float(attributes.get("rpm_current_ref", 150.0))
-        if self._rpm_current_ref < 10.0:
-            self._rpm_current_ref = 10.0
-        self._rpm_breakaway_current = float(
-            attributes.get("rpm_breakaway_current", 6.0)
-        )
-        if self._rpm_breakaway_current < 0:
-            self._rpm_breakaway_current = 0.0
-        self._rpm_breakaway_current = min(
-            self._rpm_breakaway_current, self._rpm_max_current
-        )
-        self._rpm_breakaway_rpm = float(attributes.get("rpm_breakaway_rpm", 2.0))
-        if self._rpm_breakaway_rpm < 0:
-            self._rpm_breakaway_rpm = 2.0
-        self._rpm_stall_timeout = float(attributes.get("rpm_stall_timeout", 0.08))
-        if self._rpm_stall_timeout < 0:
-            self._rpm_stall_timeout = 0.08
+        self._rpm_kp = float(attributes.get("rpm_kp", 0.0))
+        self._rpm_ki = float(attributes.get("rpm_ki", 0.0))
+        self._rpm_max_duty = float(attributes.get("rpm_max_duty", 1.0))
+        if self._rpm_max_duty <= 0 or self._rpm_max_duty > 1.0:
+            self._rpm_max_duty = 1.0
+        self._rpm_duty_ref = float(attributes.get("rpm_duty_ref", 150.0))
+        if self._rpm_duty_ref < 10.0:
+            self._rpm_duty_ref = 10.0
         self._rpm_integral = 0.0
-        self._rpm_cmd_current = 0.0
-        self._rpm_stall_since = None
-        self._rpm_broke_free = False
+        self._rpm_cmd_duty = 0.0
         self._measured_rpm = 0.0
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
@@ -211,8 +189,7 @@ class Vesc(Motor, EasyResource):
         self.logger.info(
             "VESC config: transport=%s ramp_up_enabled=%s ramp_up_rate=%s "
             "command_interval=%s ticks_per_rotation=%s closed_loop_rpm=%s "
-            "rpm_kp=%s rpm_ki=%s rpm_max_current=%s rpm_current_ref=%s "
-            "rpm_breakaway_current=%s rpm_breakaway_rpm=%s rpm_stall_timeout=%s",
+            "rpm_kp=%s rpm_ki=%s rpm_max_duty=%s rpm_duty_ref=%s",
             self._transport_name,
             self._ramp_up_enabled,
             self._ramp_up_rate,
@@ -221,11 +198,8 @@ class Vesc(Motor, EasyResource):
             self._closed_loop_rpm,
             self._rpm_kp,
             self._rpm_ki,
-            self._rpm_max_current,
-            self._rpm_current_ref,
-            self._rpm_breakaway_current,
-            self._rpm_breakaway_rpm,
-            self._rpm_stall_timeout,
+            self._rpm_max_duty,
+            self._rpm_duty_ref,
         )
 
         try:
@@ -291,38 +265,48 @@ class Vesc(Motor, EasyResource):
             return False
         return self._transport.get_tachometer() is not None
 
-    def _start_rpm_keepalive(self, rpm: float) -> None:
-        """Caller must hold `_lock`. Starts RPM keepalive / closed-loop speed task."""
+    def _start_rpm_keepalive(self, rpm: float, *, allow_ramp: bool = True) -> None:
+        """Caller must hold `_lock`. Starts RPM keepalive / closed-loop speed task.
+
+        ``allow_ramp``: SetVelocity keeps proportional setpoint ramping so L/R
+        ratio holds. GoFor/MoveStraight/Spin must NOT ramp from the previous
+        move — ramping left from a prior spin (-rpm) toward +rpm while right
+        stays +rpm makes the base yaw/weave ("multiple directions").
+        """
         self._rpm_goal = rpm
         self._target_rpm = rpm
         self._is_powered = rpm != 0.0
         self._is_moving = rpm != 0.0
-        # Feedforward carries the bulk of the command; keep trim integral small
-        # so a new SetRPM/GoFor does not inherit a huge rewind from the last move.
-        if self._rpm_ki > 1e-9 and rpm != 0.0 and self._rpm_current_ref > 1e-9:
-            ff = (rpm / self._rpm_current_ref) * self._rpm_max_current
-            self._rpm_integral = (self._rpm_cmd_current - ff) / self._rpm_ki
-        else:
-            self._rpm_integral = 0.0
-        # Ramp the RPM *setpoint* (not current). Same progress rate on every motor
-        # keeps left/right ratio constant — required for SetVelocity turn-in-place
-        # vs straight.
-        self._rpm_ramp_from = self._rpm_setpoint
-        if self._ramp_up_enabled and self._ramp_up_rate > 0 and rpm != self._rpm_setpoint:
-            self._rpm_ramp_progress = 0.0
-        else:
-            self._rpm_ramp_progress = 1.0
-            self._rpm_setpoint = rpm
-        self._rpm_stall_since = None
-        self._rpm_broke_free = False
+        self._rpm_integral = 0.0
+        # Drop opposite-direction duty immediately (no slew through reverse).
+        if rpm == 0.0 or self._rpm_cmd_duty * rpm < 0:
+            self._rpm_cmd_duty = 0.0
+            self._current_power = 0.0
+
         if rpm == 0.0:
             self._rpm_setpoint = 0.0
+            self._rpm_ramp_from = 0.0
             self._rpm_ramp_progress = 1.0
-            self._rpm_cmd_current = 0.0
-            self._current_power = 0.0
             if self._transport is not None:
-                self._transport.set_current(0.0)
+                self._transport.set_duty(0.0)
             return
+
+        if (
+            allow_ramp
+            and self._ramp_up_enabled
+            and self._ramp_up_rate > 0
+            and rpm != self._rpm_setpoint
+        ):
+            if self._rpm_setpoint * rpm < 0:
+                self._rpm_ramp_from = 0.0
+            else:
+                self._rpm_ramp_from = self._rpm_setpoint
+            self._rpm_ramp_progress = 0.0
+        else:
+            self._rpm_ramp_from = rpm
+            self._rpm_ramp_progress = 1.0
+            self._rpm_setpoint = rpm
+
         self._stop_rpm_task = False
         self._rpm_task = asyncio.create_task(self._rpm_control_task())
 
@@ -416,11 +400,11 @@ class Vesc(Motor, EasyResource):
             transport = self._require_transport()
             closed = self._can_use_rpm_closed_loop()
             if closed:
-                self._start_rpm_keepalive(signed_rpm)
+                self._start_rpm_keepalive(signed_rpm, allow_ramp=False)
             else:
                 if not transport.set_rpm(signed_rpm):
                     raise RuntimeError("Failed to set RPM for GoFor")
-                self._start_rpm_keepalive(signed_rpm)
+                self._start_rpm_keepalive(signed_rpm, allow_ramp=False)
 
         self.logger.info(
             "GoFor: start=%.3f target=%.3f rev=%.3f travel=%.3f rpm=%.1f",
@@ -584,9 +568,9 @@ class Vesc(Motor, EasyResource):
         """Set motor speed.
 
         With CAN + tachometer and closed_loop_rpm (default on CAN), ``rpm`` is
-        mechanical shaft RPM: a PI loop measures tach speed and commands motor
-        current (torque) so VESC FOC tracks it. Otherwise ``rpm`` is sent as
-        open-loop VESC ERPM (with keepalive).
+        mechanical shaft RPM: duty is commanded from the setpoint (same path as
+        SetPower). Tachometer is used for position / GoFor distance, not torque.
+        Otherwise ``rpm`` is sent as open-loop VESC ERPM (with keepalive).
         """
         await self._halt_control_tasks()
         async with self._lock:
@@ -594,10 +578,9 @@ class Vesc(Motor, EasyResource):
                 transport = self._require_transport()
                 closed = self._can_use_rpm_closed_loop()
                 if closed:
-                    # Kick with current from the control loop; no open-loop ERPM.
                     self._start_rpm_keepalive(rpm)
                     self.logger.info(
-                        "Set mechanical RPM to %.1f (closed-loop tach/current)", rpm
+                        "Set mechanical RPM to %.1f (closed-loop duty map)", rpm
                     )
                 else:
                     if not transport.set_rpm(rpm):
@@ -719,9 +702,7 @@ class Vesc(Motor, EasyResource):
             self._current_rpm = 0.0
             self._measured_rpm = 0.0
             self._rpm_integral = 0.0
-            self._rpm_cmd_current = 0.0
-            self._rpm_stall_since = None
-            self._rpm_broke_free = False
+            self._rpm_cmd_duty = 0.0
             self._is_moving = False
             self.logger.info("Motor stopped")
 
@@ -805,8 +786,8 @@ class Vesc(Motor, EasyResource):
                 "target_rpm": self._target_rpm,
                 "rpm_setpoint": self._rpm_setpoint,
                 "rpm_ramp_progress": self._rpm_ramp_progress,
-                "rpm_cmd_current": self._rpm_cmd_current,
-                "rpm_max_current": self._rpm_max_current,
+                "rpm_cmd_duty": self._rpm_cmd_duty,
+                "rpm_duty_ref": self._rpm_duty_ref,
                 "closed_loop_rpm": self._closed_loop_rpm,
                 "is_moving": self._is_moving,
                 "position": self._position,
@@ -914,9 +895,7 @@ class Vesc(Motor, EasyResource):
                 self._current_rpm = 0.0
                 self._measured_rpm = 0.0
                 self._rpm_integral = 0.0
-                self._rpm_cmd_current = 0.0
-                self._rpm_stall_since = None
-                self._rpm_broke_free = False
+                self._rpm_cmd_duty = 0.0
                 self._is_moving = False
                 self._current_ramp_power = 0.0
             return {
@@ -952,14 +931,14 @@ class Vesc(Motor, EasyResource):
             transport.close()
 
     async def _rpm_control_task(self):
-        """Keepalive + optional closed-loop mechanical RPM via tach → current.
+        """Keepalive + closed-loop mechanical RPM via setpoint → duty.
 
-        Closed-loop (CAN + tach): target is shaft RPM; PI adjusts motor current
-        so VESC FOC produces the torque needed. Open-loop: re-send SET_RPM (ERPM).
+        Closed-loop (CAN + tach present): map shaft RPM setpoint to duty cycle
+        (same actuator SetPower uses). Tach updates measured RPM for telemetry;
+        GoFor still stops on tach position. Open-loop: re-send SET_RPM (ERPM).
 
-        When ramp_up_enabled, the RPM *setpoint* ramps as a fraction of the
-        goal change per second (``ramp_up_rate``). That keeps left/right
-        speed ratio constant during a wheeled-base SetVelocity (linear+angular).
+        GoFor disables setpoint ramp. SetVelocity may ramp setpoints so L/R
+        ratio stays constant.
         """
         last_logged = 0.0
         while True:
@@ -973,11 +952,8 @@ class Vesc(Motor, EasyResource):
                     ticks = self._ticks_per_rotation
                     kp = self._rpm_kp
                     ki = self._rpm_ki
-                    max_current = self._rpm_max_current
-                    current_ref = self._rpm_current_ref
-                    breakaway_current = self._rpm_breakaway_current
-                    breakaway_rpm = self._rpm_breakaway_rpm
-                    stall_timeout = self._rpm_stall_timeout
+                    max_duty = self._rpm_max_duty
+                    duty_ref = self._rpm_duty_ref
                     ramp_enabled = self._ramp_up_enabled
                     ramp_rate = self._ramp_up_rate
                     ramp_from = self._rpm_ramp_from
@@ -990,18 +966,12 @@ class Vesc(Motor, EasyResource):
                     integral = self._rpm_integral
                     tach_last = self._rpm_tach_last
                     tach_last_ts = self._rpm_tach_last_ts
-                    meas_last_ts = self._rpm_meas_last_ts
                     measured = self._measured_rpm
-                    stall_since = self._rpm_stall_since
-                    broke_free = self._rpm_broke_free
-                    prev_current = self._rpm_cmd_current
 
                 if transport is None:
                     await asyncio.sleep(interval)
                     continue
 
-                # Proportional setpoint ramp: progress 0→1 at ramp_up_rate / second.
-                # Duration is the same for every motor (≈ 1/rate), so L/R ratio holds.
                 if ramp_enabled and ramp_rate > 0 and ramp_progress < 1.0:
                     ramp_progress = min(1.0, ramp_progress + ramp_rate * interval)
                     setpoint = ramp_from + (goal - ramp_from) * ramp_progress
@@ -1022,8 +992,8 @@ class Vesc(Motor, EasyResource):
                 tach = transport.get_tachometer()
                 now = time.monotonic()
 
+                # Telemetry-only speed estimate (does not drive torque).
                 if tach is not None and tach_last is None:
-                    # Seed tach; wait for a second sample before trusting speed.
                     tach_last = tach
                     tach_last_ts = now
                     measured = 0.0
@@ -1037,112 +1007,64 @@ class Vesc(Motor, EasyResource):
                     real_dt = min(real_dt, 0.5)
                     drevs = (tach - tach_last) / ticks
                     instant = (drevs / real_dt) * 60.0
-                    # Heavy EMA: STATUS_5 ticks are sparse; chasing them pulses torque.
-                    measured = 0.9 * measured + 0.1 * instant
+                    measured = 0.8 * measured + 0.2 * instant
                     tach_last = tach
                     tach_last_ts = now
-                    meas_last_ts = now
                 elif tach_last_ts is not None and (now - tach_last_ts) > 0.6:
-                    # Hold speed between ticks. Only bleed to 0 after a long gap.
-                    measured *= 0.92
+                    measured *= 0.9
                     if abs(measured) < 0.5:
                         measured = 0.0
 
-                # Feedforward from setpoint (smooth, like SetPower). Tach PI is
-                # only a slow trim — sparse encoder feedback must not own torque.
-                sp_scale = min(1.0, abs(setpoint) / 25.0)
-                if abs(setpoint) < 1e-9 or current_ref < 1e-9:
-                    ff = 0.0
+                # Duty feedforward from setpoint — same class of command as SetPower.
+                if abs(setpoint) < 1e-9 or duty_ref < 1e-9:
+                    duty = 0.0
                 else:
-                    ff = (setpoint / current_ref) * max_current
-                    # Tiny crawl floor so very low RPM still produces some torque.
-                    ff_floor = 0.03 * max_current * sp_scale
-                    if 0.0 < abs(ff) < ff_floor:
-                        ff = ff_floor if ff > 0 else -ff_floor
-                ff = max(-max_current, min(max_current, ff))
+                    duty = setpoint / duty_ref
+                    # Small crawl floor so tiny RPM still moves (scaled in).
+                    floor = 0.05 * min(1.0, abs(setpoint) / 25.0)
+                    if 0.0 < abs(duty) < floor:
+                        duty = floor if duty > 0 else -floor
+                duty = max(-max_duty, min(max_duty, duty))
 
-                error = setpoint - measured
-                integral += error * interval
-                # Trim-only integral authority (~25% of max).
-                if ki > 1e-9:
-                    i_lim = (0.25 * max_current) / ki
-                    integral = max(-i_lim, min(i_lim, integral))
+                # Optional slow tach trim (default gains are 0).
+                if kp != 0.0 or ki != 0.0:
+                    error = setpoint - measured
+                    integral += error * interval
+                    if ki > 1e-9:
+                        i_lim = (0.2 * max_duty) / ki
+                        integral = max(-i_lim, min(i_lim, integral))
+                    trim = kp * error + ki * integral
+                    trim = max(-0.2 * max_duty, min(0.2 * max_duty, trim))
+                    duty = max(-max_duty, min(max_duty, duty + trim))
+                    # Never reverse against setpoint.
+                    if setpoint > 0.0 and duty < 0.0:
+                        duty = 0.0
+                    elif setpoint < 0.0 and duty > 0.0:
+                        duty = 0.0
 
-                trim = kp * error + ki * integral
-                # Cap trim so tach noise cannot overpower feedforward.
-                trim_lim = 0.35 * max_current
-                trim = max(-trim_lim, min(trim_lim, trim))
-                current = max(-max_current, min(max_current, ff + trim))
-                if abs(trim) >= trim_lim and error * trim > 0:
-                    integral -= error * interval
-
-                if abs(measured) >= breakaway_rpm:
-                    broke_free = True
-                    stall_since = None
-
-                # One-shot standstill assist only (never re-pulse after motion).
-                breakaway_active = False
-                if (
-                    not broke_free
-                    and abs(setpoint) > 0.0
-                    and abs(measured) < breakaway_rpm
-                ):
-                    if stall_since is None:
-                        stall_since = now
-                    boost_mag = breakaway_current * sp_scale
-                    if (now - stall_since) >= stall_timeout and boost_mag > 0:
-                        sign = 1.0 if setpoint > 0 else -1.0
-                        boost = sign * min(boost_mag, max_current)
-                        if abs(boost) > abs(current):
-                            current = boost
-                            breakaway_active = True
-                else:
-                    if broke_free or abs(measured) >= breakaway_rpm:
-                        stall_since = None
-
-                # Gentle slew: keep current changes SetPower-smooth.
-                max_di = 12.0 * interval  # A/s
-                if current > prev_current + max_di:
-                    current = prev_current + max_di
-                elif current < prev_current - max_di:
-                    current = prev_current - max_di
-
-                transport.set_current(current)
-
-                # Report power as fraction of max current for Viam is_powered.
-                power_frac = (
-                    current / max_current if max_current > 1e-9 else 0.0
-                )
+                transport.set_duty(duty)
 
                 async with self._lock:
                     self._rpm_integral = integral
-                    self._rpm_cmd_current = current
+                    self._rpm_cmd_duty = duty
                     self._rpm_setpoint = setpoint
                     self._rpm_ramp_progress = ramp_progress
                     self._target_rpm = goal
                     self._measured_rpm = measured
                     self._current_rpm = measured
-                    self._current_power = power_frac
+                    self._current_power = duty
                     self._rpm_tach_last = tach_last
                     self._rpm_tach_last_ts = tach_last_ts
-                    self._rpm_meas_last_ts = meas_last_ts
-                    self._rpm_stall_since = stall_since
-                    self._rpm_broke_free = broke_free
-                    self._is_moving = abs(measured) > 0.5 or abs(current) > 0.5
+                    self._is_moving = abs(measured) > 0.5 or abs(duty) > 0.02
 
                 if now - last_logged >= 0.5:
                     self.logger.info(
-                        "RPM loop: goal=%.1f set=%.1f meas=%.1f I=%.2fA "
-                        "ff=%.2f trim=%.2f prog=%.2f err=%.1f breakaway=%s",
+                        "RPM loop: goal=%.1f set=%.1f meas=%.1f duty=%.3f prog=%.2f",
                         goal,
                         setpoint,
                         measured,
-                        current,
-                        ff,
-                        trim,
+                        duty,
                         ramp_progress,
-                        error,
-                        breakaway_active,
                     )
                     last_logged = now
 
