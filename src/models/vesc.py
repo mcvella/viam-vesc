@@ -386,6 +386,12 @@ class Vesc(Motor, EasyResource):
     ):
         """Go for a specific number of revolutions at a given RPM.
 
+        Direction follows the Viam motor API: negative ``rpm`` *or* negative
+        ``revolutions`` means backward; if *both* are negative the motor goes
+        forward. Wheeled-base ``Spin`` relies on this — it calls
+        ``GoFor(-rpm, +revs)`` on the left and ``GoFor(+rpm, +revs)`` on the
+        right.
+
         On CAN with tachometer odometry, runs closed-loop until the measured
         position reaches the target. Serial (no encoder) falls back to timed motion.
         """
@@ -393,10 +399,12 @@ class Vesc(Motor, EasyResource):
             await self.stop()
             return
 
-        # Direction from revolutions; magnitude from |rpm|.
-        signed_rpm = abs(rpm) if revolutions > 0 else -abs(rpm)
+        # Same-sign rpm/revolutions → forward; opposite signs → backward.
+        # (Do not ignore rpm sign: that made Spin drive both wheels forward.)
+        travel = abs(revolutions) if (rpm > 0) == (revolutions > 0) else -abs(revolutions)
+        signed_rpm = abs(rpm) if travel > 0 else -abs(rpm)
         start = await self.get_position()
-        target = start + revolutions
+        target = start + travel
 
         await self._halt_control_tasks()
         async with self._lock:
@@ -410,10 +418,11 @@ class Vesc(Motor, EasyResource):
                 self._start_rpm_keepalive(signed_rpm)
 
         self.logger.info(
-            "GoFor: start=%.3f target=%.3f rev=%.3f rpm=%.1f",
+            "GoFor: start=%.3f target=%.3f rev=%.3f travel=%.3f rpm=%.1f",
             start,
             target,
             revolutions,
+            travel,
             signed_rpm,
         )
 
@@ -429,13 +438,13 @@ class Vesc(Motor, EasyResource):
                 await self._wait_for_position(
                     start=start,
                     target=target,
-                    moving_positive=revolutions > 0,
-                    distance_revs=abs(revolutions),
+                    moving_positive=travel > 0,
+                    distance_revs=abs(travel),
                     rpm_abs=abs(rpm),
                     timeout=timeout,
                 )
             else:
-                time_needed = abs(revolutions / rpm) * 60.0
+                time_needed = abs(travel / rpm) * 60.0
                 if timeout is not None and timeout > 0:
                     time_needed = min(time_needed, timeout)
                 self.logger.warning(
@@ -542,6 +551,8 @@ class Vesc(Motor, EasyResource):
         """Go to an absolute position (revolutions) at a given RPM."""
         current_position = await self.get_position()
         revolutions_needed = position_revolutions - current_position
+        # Direction comes from the position delta; |rpm| is speed only so a
+        # negative rpm argument cannot invert GoFor's XOR sign rule.
         self.logger.info(
             "GoTo: current=%.3f target=%.3f delta=%.3f rpm=%.1f",
             current_position,
@@ -550,7 +561,11 @@ class Vesc(Motor, EasyResource):
             rpm,
         )
         await self.go_for(
-            rpm, revolutions_needed, extra=extra, timeout=timeout, **kwargs
+            abs(rpm),
+            revolutions_needed,
+            extra=extra,
+            timeout=timeout,
+            **kwargs,
         )
 
     async def set_rpm(
