@@ -77,6 +77,7 @@ class Vesc(Motor, EasyResource):
         self._rpm_integral = 0.0
         self._rpm_cmd_current = 0.0
         self._rpm_stall_since: Optional[float] = None
+        self._rpm_broke_free = False
         self._measured_rpm = 0.0
         self._rpm_tach_last: Optional[float] = None
         self._rpm_tach_last_ts: Optional[float] = None
@@ -197,6 +198,7 @@ class Vesc(Motor, EasyResource):
         self._rpm_integral = 0.0
         self._rpm_cmd_current = 0.0
         self._rpm_stall_since = None
+        self._rpm_broke_free = False
         self._measured_rpm = 0.0
         self._rpm_tach_last = None
         self._rpm_tach_last_ts = None
@@ -310,6 +312,7 @@ class Vesc(Motor, EasyResource):
             self._rpm_ramp_progress = 1.0
             self._rpm_setpoint = rpm
         self._rpm_stall_since = None
+        self._rpm_broke_free = False
         if rpm == 0.0:
             self._rpm_setpoint = 0.0
             self._rpm_ramp_progress = 1.0
@@ -716,6 +719,7 @@ class Vesc(Motor, EasyResource):
             self._rpm_integral = 0.0
             self._rpm_cmd_current = 0.0
             self._rpm_stall_since = None
+            self._rpm_broke_free = False
             self._is_moving = False
             self.logger.info("Motor stopped")
 
@@ -910,6 +914,7 @@ class Vesc(Motor, EasyResource):
                 self._rpm_integral = 0.0
                 self._rpm_cmd_current = 0.0
                 self._rpm_stall_since = None
+                self._rpm_broke_free = False
                 self._is_moving = False
                 self._current_ramp_power = 0.0
             return {
@@ -986,6 +991,8 @@ class Vesc(Motor, EasyResource):
                     meas_last_ts = self._rpm_meas_last_ts
                     measured = self._measured_rpm
                     stall_since = self._rpm_stall_since
+                    broke_free = self._rpm_broke_free
+                    prev_current = self._rpm_cmd_current
 
                 if transport is None:
                     await asyncio.sleep(interval)
@@ -1033,9 +1040,18 @@ class Vesc(Motor, EasyResource):
                     tach_last = tach
                     tach_last_ts = now
                     meas_last_ts = now
-                elif meas_last_ts is not None and (now - meas_last_ts) > 0.35:
-                    # No tach motion for a while → treat as stopped.
-                    measured = 0.0
+                elif tach_last is not None and tach_last_ts is not None:
+                    # No new tick yet: do NOT snap measured to 0 (that retriggers
+                    # breakaway and makes spin pulse). Cap |RPM| by how long it
+                    # has been since the last tick (one tick / dt).
+                    dt = max(now - tach_last_ts, 1e-3)
+                    tick_rpm = (1.0 / max(abs(ticks), 1e-9) / dt) * 60.0
+                    if tick_rpm < 0.5:
+                        measured = 0.0
+                    elif abs(measured) > tick_rpm:
+                        measured = (
+                            tick_rpm if measured > 0 else -tick_rpm
+                        )
 
                 error = setpoint - measured
                 integral += error * interval
@@ -1060,19 +1076,23 @@ class Vesc(Motor, EasyResource):
                 if abs(raw) > auth and error * raw > 0:
                     integral -= error * interval
 
-                # Stall / breakaway (separate from soft auth): when commanded to
-                # move but tach still shows ~0 RPM, lift current toward a
-                # setpoint-scaled breakaway so FOC can overcome stiction. Scaling
-                # avoids slamming tiny opposite L/R spin commands.
+                # Stall / breakaway (separate from soft auth): assist only to
+                # leave a true standstill. After first motion, latch broke_free
+                # so sparse tach ticks cannot re-trigger boost (that pulsed spin).
+                # A long re-stall (e.g. hit an obstacle) can assist again.
+                if abs(measured) >= breakaway_rpm:
+                    broke_free = True
+                    stall_since = None
+
                 breakaway_active = False
                 if abs(setpoint) > 0.0 and abs(measured) < breakaway_rpm:
                     if stall_since is None:
                         stall_since = now
                     boost_mag = breakaway_current * sp_scale
-                    if (
-                        (now - stall_since) >= stall_timeout
-                        and boost_mag > 0
-                    ):
+                    need = stall_timeout
+                    if broke_free:
+                        need = max(stall_timeout * 5.0, 0.5)
+                    if (now - stall_since) >= need and boost_mag > 0:
                         sign = 1.0 if setpoint > 0 else -1.0
                         boost = sign * min(boost_mag, max_current)
                         if abs(boost) > abs(current) or current * boost <= 0:
@@ -1080,6 +1100,13 @@ class Vesc(Motor, EasyResource):
                             breakaway_active = True
                 else:
                     stall_since = None
+
+                # Slew-limit current so tach quantization cannot torque-pulse.
+                max_di = 30.0 * interval  # A/s
+                if current > prev_current + max_di:
+                    current = prev_current + max_di
+                elif current < prev_current - max_di:
+                    current = prev_current - max_di
 
                 transport.set_current(current)
 
@@ -1101,6 +1128,7 @@ class Vesc(Motor, EasyResource):
                     self._rpm_tach_last_ts = tach_last_ts
                     self._rpm_meas_last_ts = meas_last_ts
                     self._rpm_stall_since = stall_since
+                    self._rpm_broke_free = broke_free
                     self._is_moving = abs(measured) > 0.5 or abs(current) > 0.5
 
                 if now - last_logged >= 0.5:
