@@ -57,7 +57,7 @@ Use `transport` to select the I/O backend (`serial` default, or `can`).
 | `rpm_kp` | float | Optional | `0.1` | Proportional gain (amps per RPM error) for closed-loop speed |
 | `rpm_ki` | float | Optional | `0.25` | Integral gain (amps per RPM·s) for closed-loop speed |
 | `rpm_max_current` | float | Optional | `15` | Hard cap on \|current\| (A) from the RPM loop — raise for heavier hub motors |
-| `rpm_current_ref` | float | Optional | `150` | Soft authority reaches `rpm_max_current` near this shaft RPM (+ breakaway floor) |
+| `rpm_current_ref` | float | Optional | `150` | Soft authority reaches `rpm_max_current` near this shaft RPM (+ 5%·scaled floor) |
 | `rpm_breakaway_current` | float | Optional | `8` | Amps commanded when stalled near 0 RPM (capped by `rpm_max_current`) |
 | `rpm_breakaway_rpm` | float | Optional | `3` | Measured RPM below this counts as “not moving” for stall assist |
 | `rpm_stall_timeout` | float | Optional | `0.1` | Seconds of near-zero measured RPM before applying breakaway current |
@@ -66,7 +66,7 @@ CAN uses 29-bit extended frames with ID `(command << 8) | id`, matching the [VES
 
 **Position (CAN):** `GetPosition` uses the STATUS_5 (`0x1B00 \| id`) **tachometer** (signed int32 in bytes 0–3). Revolutions = `(tachometer − zero) / ticks_per_rotation`. `attributes.id` must match the VESC id in that frame. Call `ResetZeroPosition` after startup before measuring travel. DoCommand `{"command":"get_position_debug"}` shows whether STATUS_5 was seen. Serial still uses a software counter.
 
-**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and commands **motor current** (`SET_CURRENT`) so VESC FOC supplies torque. If measured RPM stays below `rpm_breakaway_rpm` for `rpm_stall_timeout`, the loop temporarily applies `rpm_breakaway_current` to overcome stiction. No `pole_pairs` needed. RPM setpoints ramp proportionally via `ramp_up_enabled` / `ramp_up_rate` (preserves differential-drive turn ratio). Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm`, `rpm_setpoint`, and `rpm_cmd_current`.
+**Speed (CAN):** With `closed_loop_rpm` (default on), `SetRPM` is **shaft RPM**: the module measures speed from tach deltas and commands **motor current** (`SET_CURRENT`) so VESC FOC supplies torque. Soft authority uses a small setpoint-scaled floor (`5%` of `rpm_max_current`), separate from stall assist. If measured RPM stays below `rpm_breakaway_rpm` for `rpm_stall_timeout`, the loop temporarily applies a **setpoint-scaled** breakaway current (`rpm_breakaway_current * min(1, |rpm|/25)`) to overcome stiction without slamming tiny spin commands. No `pole_pairs` needed. RPM setpoints ramp proportionally via `ramp_up_enabled` / `ramp_up_rate` (preserves differential-drive turn ratio). Set `closed_loop_rpm: false` to send raw VESC ERPM instead. DoCommand `get_status` reports `measured_rpm`, `rpm_setpoint`, and `rpm_cmd_current`.
 
 **SocketCAN is Linux-only.** Bring up the interface before starting the module, for example:
 

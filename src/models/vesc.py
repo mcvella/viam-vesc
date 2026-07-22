@@ -69,7 +69,7 @@ class Vesc(Motor, EasyResource):
         self._rpm_kp = 0.1  # A per RPM error (~1 A at 10 RPM error)
         self._rpm_ki = 0.25  # A per RPM·s
         self._rpm_max_current = 15.0  # hard |current| cap (A); raise for heavier drives
-        # Soft authority reaches rpm_max_current near this shaft RPM (+ breakaway floor).
+        # Soft authority reaches rpm_max_current near this shaft RPM (+ small % floor).
         self._rpm_current_ref = 150.0
         self._rpm_breakaway_current = 8.0  # A while stuck near 0 RPM
         self._rpm_breakaway_rpm = 3.0  # below this = "not moving yet"
@@ -1029,9 +1029,12 @@ class Vesc(Motor, EasyResource):
                     i_lim = (max_current / ki) * 1.5
                     integral = max(-i_lim, min(i_lim, integral))
 
-                # Soft authority scales with |setpoint| so tiny crawl commands
-                # cannot saturate to full current while the loop learns.
-                floor = breakaway_current * min(1.0, abs(setpoint) / 25.0)
+                # Soft authority scales with |setpoint| so tiny crawl/spin
+                # commands cannot saturate to full current while the loop learns.
+                # Floor is a small fixed % of max current (not breakaway amps) —
+                # using breakaway here made low-RPM auth huge and jerky.
+                sp_scale = min(1.0, abs(setpoint) / 25.0)
+                floor = 0.05 * max_current * sp_scale
                 auth = min(
                     max_current,
                     abs(setpoint) / current_ref * max_current + floor,
@@ -1042,16 +1045,21 @@ class Vesc(Motor, EasyResource):
                 if abs(raw) > auth and error * raw > 0:
                     integral -= error * interval
 
-                # Stall / breakaway: when commanded to move but tach still shows
-                # ~0 RPM, temporarily command breakaway current so FOC can overcome
-                # stiction. Cleared as soon as motion is detected.
+                # Stall / breakaway (separate from soft auth): when commanded to
+                # move but tach still shows ~0 RPM, lift current toward a
+                # setpoint-scaled breakaway so FOC can overcome stiction. Scaling
+                # avoids slamming tiny opposite L/R spin commands.
                 breakaway_active = False
                 if abs(setpoint) > 0.0 and abs(measured) < breakaway_rpm:
                     if stall_since is None:
                         stall_since = now
-                    if (now - stall_since) >= stall_timeout and breakaway_current > 0:
-                        boost = (1.0 if setpoint > 0 else -1.0) * breakaway_current
-                        boost = max(-max_current, min(max_current, boost))
+                    boost_mag = breakaway_current * sp_scale
+                    if (
+                        (now - stall_since) >= stall_timeout
+                        and boost_mag > 0
+                    ):
+                        sign = 1.0 if setpoint > 0 else -1.0
+                        boost = sign * min(boost_mag, max_current)
                         if abs(boost) > abs(current) or current * boost <= 0:
                             current = boost
                             breakaway_active = True
